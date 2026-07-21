@@ -29,6 +29,24 @@ A baked navmesh generator for Roblox with authored, destructible environments.
 
 ## Floor & boundary extraction
 
+### Floor extraction (implemented — `src/Floor.lua`)
+
+`NVGN.Floor` produces one **surfel** per 1-stud walkable cell:
+
+```
+Surfel   = { pos, normal, slope, clearance, width, part }
+FloorData = { surfels = {...}, index = {"x:z" -> {surfels}}, config }
+```
+
+- **Candidates** come from the SVO (solid voxel with empty space above). Each candidate's top face is walked at **1-stud resolution regardless of node size** — a collapsed big node sampled once misses ~60% of the floor and misses that one node can cover several parts, so every 1×1 cell gets its own raycast.
+- **Exact surface** (height + normal) comes from a **downward raycast onto the real part**, so ramps are smooth, not stair-stepped. `slope > maxSlope` (default **65°**, Cocosulx-tested) is dropped unless the part is a `ClipRamp` (always walkable).
+- **Clearance** = an **upward raycast** to the real ceiling. (Not SVO voxel-stepping — the conservative over-voxelization inflates surfaces and corrupts sub-voxel clearance near tilted/thin geometry.)
+- **Width** = min distance over N horizontal rays (default 8) at torso height = distance to nearest wall, for agent-radius filtering. (Floor-edge/drop-off proximity is the boundary stage's job, not width.)
+- The `index` is a 1-stud spatial hash; a key can hold **several surfels at different heights** (multi-level floors), for neighbour lookups in the boundary/polygonization stage.
+- Cost: full bake (gather + SVO + extract with clearance/width rays) ≈ **2.8 s** for the 177-part test scene → ~49.5k surfels.
+
+### Boundaries (next)
+
 The floor filter answers only *"is there floor here?"*. Boundaries come from geometry, from two sources:
 
 - **Vertical faces (walls/obstacles).** For each blocking face:
