@@ -11,11 +11,20 @@ A baked navmesh generator for Roblox with authored, destructible environments.
 
 ## Substrate
 
-1. **Sparse Voxel Octree (SVO)** gives a fast solid/empty broad-phase read of the world. Also the future substrate for flying NPCs.
-2. A **voxel pass** over the SVO yields the three fields the generator needs:
+1. **Sparse Voxel Octree (SVO)** gives a fast solid/empty read of the world. Also the future substrate for flying NPCs. Implemented in `src/SVO.lua` (`ServerScriptService.NVGN.SVO` in-place).
+2. A **surface/voxel pass** over the SVO yields the three fields the generator needs:
    - **floor** — walkable surface locations
    - **clearance** — empty vertical space above a floor voxel before hitting a ceiling/obstacle
    - **width** — distance transform to the nearest blocking voxel (corridor width)
+
+### SVO implementation notes (validated)
+
+- **Build = OBB rasterization.** Each solid part's oriented bounding box is rasterized into the octree; nodes fully inside an OBB collapse to a single solid leaf, nodes on the surface subdivide to `leafSize`. Rotated/intersecting parts voxelize cleanly (this was the original staircase pain point) — confirmed on the `project nuhh` test scene.
+- **Leaf size = 1 stud.** Over real structures this is cheap: the test scene (177 parts) builds in **~0.9 s / 51k solid leaves**. Coarser leaves (2 → 20k, 4 → 5k) are available if a broad-phase-only tree is ever wanted.
+- **Do NOT voxelize as volume:**
+  - **Terrain** — deferred (`ClassName == "Terrain"`, which *does* inherit `BasePart`, so it must be explicitly excluded or it rasterizes its whole 2000³ region).
+  - **Huge flat ground slabs** (e.g. a 2048² baseplate) — a flat floor is analytically "floor across this rectangle," not 4M voxels. These are skipped by a footprint threshold and handled as flat floor primitives in the floor stage. A global 1-stud volume of such a slab is what makes a naive build explode (measured: ~14M leaves / 3 min before the exclusion).
+- **Key lesson:** an octree's sparse win only appears where large regions *collapse*. At 1-stud resolution surfaces never collapse, so the SVO is 1-stud only over detailed structure; broad flat ground and (later) terrain floor are represented analytically, and the fine 1-stud precision lives in the floor/wall extraction stage (raycast-down), not in a global volume.
 
 ## Floor & boundary extraction
 
