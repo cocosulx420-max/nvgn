@@ -235,9 +235,71 @@ function SVO:stats()
 	}
 end
 
+-- ---- precise (real-geometry) insertion --------------------------------------
+
+-- A part whose collision geometry is a true box can use the fast OBB path.
+-- Unions, MeshParts, wedges, cylinders, etc. must be voxelized against their
+-- REAL collision geometry, or their bounding box fills the octree with phantom
+-- solid (e.g. the air inside an arch union).
+function SVO.isBlockPart(part: BasePart): boolean
+	local ok, shape = pcall(function() return (part :: any).Shape end)
+	if ok and shape ~= nil then
+		return shape == Enum.PartType.Block
+	end
+	return false -- no Shape property (Union/MeshPart/WedgePart/...) -> not a box
+end
+
+function SVO:_insertPrecise(node, nc: Vector3, nh: number, depth: number, overlaps)
+	if node.solid then return end
+	if not overlaps(nc, nh) then return end
+	if depth == 0 then
+		markSolid(node) -- real geometry touches this leaf
+		return
+	end
+	node.children = node.children or {}
+	local ch = nh * 0.5
+	for i = 0, 7 do
+		local cc = nc + OFF[i] * ch
+		local child = node.children[i] or {}
+		node.children[i] = child
+		self:_insertPrecise(child, cc, ch, depth - 1, overlaps)
+		if not child.solid and not child.children then
+			node.children[i] = nil
+		end
+	end
+	tryCollapse(node)
+end
+
+-- Voxelize a part against its real collision geometry using GetPartsInPart.
+-- Descends the octree only where the part's geometry actually overlaps a node,
+-- so concave shapes (arches, holes) are represented correctly.
+function SVO:insertPartPrecise(part: BasePart, worldRoot: WorldRoot?)
+	local root = worldRoot or workspace
+	local probe = Instance.new("Part")
+	probe.Anchored = true
+	probe.CanCollide = false
+	probe.CanQuery = false
+	probe.CanTouch = false
+	probe.Transparency = 1
+	probe.Parent = root :: any
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Include
+	op.FilterDescendantsInstances = { part }
+	op.RespectCanCollide = false
+	local function overlaps(nc: Vector3, nh: number): boolean
+		probe.Size = Vector3.new(nh * 2, nh * 2, nh * 2)
+		probe.CFrame = CFrame.new(nc)
+		return #root:GetPartsInPart(probe, op) > 0
+	end
+	self:_insertPrecise(self.root, self.center, self.half, self.maxDepth, overlaps)
+	probe:Destroy()
+end
+
 -- ---- convenience build ------------------------------------------------------
 
 -- Build an SVO from a list of parts. margin pads the world bounds.
+-- Block parts use fast OBB rasterization; non-block parts (unions/meshes/etc)
+-- are voxelized against their real collision geometry.
 function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number)
 	assert(#parts > 0, "SVO.fromParts: no parts")
 	local lo = Vector3.new(math.huge, math.huge, math.huge)
@@ -257,7 +319,11 @@ function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number)
 	local rootEdge = leaf * (2 ^ depth)
 	local tree = SVO.new(center, rootEdge * 0.5, leaf)
 	for _, part in ipairs(parts) do
-		tree:insertPart(part)
+		if SVO.isBlockPart(part) then
+			tree:insertPart(part)          -- fast OBB path
+		else
+			tree:insertPartPrecise(part)   -- real-geometry path
+		end
 	end
 	return tree
 end
