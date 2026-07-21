@@ -5,9 +5,8 @@
 -- (solid voxels with empty space above); each candidate's top face is walked at
 -- 1-stud resolution and a raycast onto the REAL part gives exact height + normal
 -- (so ramps are smooth, not stair-stepped, and a collapsed node covering several
--- parts is sampled per-cell). Clearance is an upward raycast to the real ceiling;
--- width is the min horizontal ray distance to a wall. Only walkable surfels are
--- kept (steep faces feed the later boundary stage instead).
+-- parts is sampled per-cell). Clearance is an upward raycast to the real ceiling.
+-- Only walkable surfels are kept (steep faces feed the later boundary stage).
 
 local SVO = require(script.Parent:WaitForChild("SVO"))
 
@@ -18,14 +17,17 @@ export type Surfel = {
 	normal: Vector3,    -- surface normal
 	slope: number,      -- degrees from world-up
 	clearance: number,  -- studs of headroom above (capped)
-	width: number,      -- studs to nearest wall, horizontal (capped)
 	part: BasePart,     -- the part under this surfel
 }
 
+-- NOTE: horizontal "width" (distance to nearest wall) is intentionally NOT baked.
+-- It is redundant with the navmesh boundary edges and is derived cheaply at
+-- pathfinding time (portal-edge length + funnel radius offset). Clearance IS
+-- baked because vertical headroom cannot be recovered from 2D boundaries.
+
 export type Config = {
 	leaf: number?, maxSlope: number?, agentHeight: number?,
-	clearCap: number?, maxWidth: number?, torso: number?, widthRays: number?,
-	maxGroundFootprint: number?,
+	clearCap: number?, maxGroundFootprint: number?,
 }
 
 local DEFAULT = {
@@ -33,9 +35,6 @@ local DEFAULT = {
 	maxSlope = 65,            -- max walkable slope (deg); Cocosulx-tested
 	agentHeight = 5,          -- reference stand height
 	clearCap = 20,            -- clearance raycast cap
-	maxWidth = 10,            -- width raycast cap
-	torso = 2.5,              -- height above surface to cast width rays
-	widthRays = 8,            -- horizontal directions for width
 	maxGroundFootprint = 400, -- parts wider than this (baseplate) are excluded
 }
 
@@ -84,12 +83,6 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	rp.FilterType = Enum.RaycastFilterType.Include
 	rp.FilterDescendantsInstances = parts
 
-	local dirs = table.create(c.widthRays)
-	for k = 0, c.widthRays - 1 do
-		local a = k * (2 * math.pi) / c.widthRays
-		dirs[k + 1] = Vector3.new(math.cos(a), 0, math.sin(a))
-	end
-
 	local surfels: {Surfel} = {}
 	local index: { [string]: {Surfel} } = {}
 
@@ -110,19 +103,9 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 				-- clearance: upward raycast to the real ceiling
 				local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), Vector3.new(0, c.clearCap, 0), rp)
 				local clearance = upRes and upRes.Distance or c.clearCap
-				-- width: min horizontal ray distance to a wall
-				local origin = res.Position + Vector3.new(0, c.torso, 0)
-				local width = c.maxWidth
-				for _, dir in ipairs(dirs) do
-					local wr = workspace:Raycast(origin, dir * c.maxWidth, rp)
-					if wr then
-						local dd = (wr.Position - origin).Magnitude
-						if dd < width then width = dd end
-					end
-				end
 				local surfel: Surfel = {
 					pos = res.Position, normal = n, slope = slope,
-					clearance = clearance, width = width, part = res.Instance,
+					clearance = clearance, part = res.Instance,
 				}
 				surfels[#surfels + 1] = surfel
 				local key = cellKey(cx, cz)
