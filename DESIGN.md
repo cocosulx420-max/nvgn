@@ -41,9 +41,9 @@ FloorData = { surfels = {...}, index = {"x:z" -> {surfels}}, config }
 - **Candidates** come from the SVO (solid voxel with empty space above). Each candidate's top face is walked at **1-stud resolution regardless of node size** — a collapsed big node sampled once misses ~60% of the floor and misses that one node can cover several parts, so every 1×1 cell gets its own raycast.
 - **Exact surface** (height + normal) comes from a **downward raycast onto the real part**, so ramps are smooth, not stair-stepped. `slope > maxSlope` (default **65°**, Cocosulx-tested) is dropped unless the part is a `ClipRamp` (always walkable).
 - **Clearance** = an **upward raycast** to the real ceiling. (Not SVO voxel-stepping — the conservative over-voxelization inflates surfaces and corrupts sub-voxel clearance near tilted/thin geometry.)
-- **Width** = min distance over N horizontal rays (default 8) at torso height = distance to nearest wall, for agent-radius filtering. (Floor-edge/drop-off proximity is the boundary stage's job, not width.)
+- **Width is deliberately NOT baked.** Horizontal distance-to-wall is redundant with the navmesh boundary edges: portal-fit is a shared-edge *length*, corridor width is a poly's two boundary edges, and agent-radius clearance from walls is a funnel offset — all derived cheaply at *pathfinding* time. Baking it would be per-surfel raycasts of data the boundaries already encode. (Clearance is different — vertical headroom is not present in the 2D boundary, so it must be baked.)
 - The `index` is a 1-stud spatial hash; a key can hold **several surfels at different heights** (multi-level floors), for neighbour lookups in the boundary/polygonization stage.
-- Cost: full bake (gather + SVO + extract with clearance/width rays) ≈ **2.8 s** for the 177-part test scene → ~49.5k surfels.
+- Cost: full bake (gather + SVO + extract) ≈ **1.7 s** for the 177-part test scene → ~49.5k surfels.
 
 ### Boundaries (next)
 
@@ -70,21 +70,20 @@ Merge aggressively into large convex polygons, splitting only when one of these 
 ```
 split if  floor-deviation > 2 studs   (discrete step tolerance)
        OR clearance changes           (e.g. open air vs. a crawl tunnel)
-       OR width changes               (e.g. corridor narrows)
 ```
 
-Slopes use the angle limit rather than the ±2 deviation, so a long ramp is not merged into flat floor. Small polygons are reserved for genuinely tricky geometry.
+Slopes use the angle limit rather than the ±2 deviation, so a long ramp is not merged into flat floor. Small polygons are reserved for genuinely tricky geometry. Note there is **no width split** — narrow corridors get their own polygons automatically because the *walls* (boundary edges) bound them; a corridor is thin because its two boundary edges are close, not because of any width annotation.
 
 ## Agents & sizing
 
-Two dimensions decide whether an agent fits: **clearance** (vertical) and **width** (`2 × radius`). Both are baked annotations from the voxel pass.
+Two dimensions decide whether an agent fits: **clearance** (vertical) and **width** (`2 × radius`). Clearance is a **baked** per-surfel/per-polygon annotation (it isn't in the 2D geometry). Width is **not** baked — it comes from the polygon/portal geometry itself at query time (a portal's shared-edge length; a corridor poly's opposing boundary edges).
 
 ### Detail band (~1–9 studs) — one annotated mesh
 
-A single mesh, with per-polygon/per-edge `clearance` and `width`. Any agent filters the shared mesh at query time:
+A single mesh with per-polygon/per-edge `clearance`. Any agent filters the shared mesh at query time:
 
 ```
-skip edge if clearance < agent_height  OR  width < 2 * agent_radius
+skip edge if clearance < agent_height  OR  portal_edge_length < 2 * agent_radius
 ```
 
 This is **continuous in agent size** — no height buckets. The mesh only splits where real geometry changes clearance/width. Because spaces are authored to their inhabitants (and larger races' architecture inherently accommodates humans), the common case — a ~5-stud human/player — filters almost nothing, so the filter is effectively free on the hot path. Its real work is limited to crawl/crouch spaces, giants, and post-destruction changes.
