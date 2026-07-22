@@ -12,10 +12,9 @@ A baked navmesh generator for Roblox with authored, destructible environments.
 ## Substrate
 
 1. **Sparse Voxel Octree (SVO)** gives a fast solid/empty read of the world. Also the future substrate for flying NPCs. Implemented in `src/SVO.lua` (`ServerScriptService.NVGN.SVO` in-place).
-2. A **surface/voxel pass** over the SVO yields the three fields the generator needs:
+2. A **surface/voxel pass** over the SVO yields the two fields the generator needs:
    - **floor** — walkable surface locations
    - **clearance** — empty vertical space above a floor voxel before hitting a ceiling/obstacle
-   - **width** — distance transform to the nearest blocking voxel (corridor width)
 
 ### SVO implementation notes (validated)
 
@@ -34,26 +33,36 @@ A baked navmesh generator for Roblox with authored, destructible environments.
 `NVGN.Floor` produces one **surfel** per 1-stud walkable cell:
 
 ```
-Surfel   = { pos, normal, slope, clearance, width, part }
+Surfel   = { pos, normal, slope, clearance, part }
 FloorData = { surfels = {...}, index = {"x:z" -> {surfels}}, config }
 ```
 
 - **Candidates** come from the SVO (solid voxel with empty space above). Each candidate's top face is walked at **1-stud resolution regardless of node size** — a collapsed big node sampled once misses ~60% of the floor and misses that one node can cover several parts, so every 1×1 cell gets its own raycast.
 - **Exact surface** (height + normal) comes from a **downward raycast onto the real part**, so ramps are smooth, not stair-stepped. `slope > maxSlope` (default **65°**, Cocosulx-tested) is dropped unless the part is a `ClipRamp` (always walkable).
 - **Clearance** = an **upward raycast** to the real ceiling. (Not SVO voxel-stepping — the conservative over-voxelization inflates surfaces and corrupts sub-voxel clearance near tilted/thin geometry.)
-- **Width is deliberately NOT baked.** Horizontal distance-to-wall is redundant with the navmesh boundary edges: portal-fit is a shared-edge *length*, corridor width is a poly's two boundary edges, and agent-radius clearance from walls is a funnel offset — all derived cheaply at *pathfinding* time. Baking it would be per-surfel raycasts of data the boundaries already encode. (Clearance is different — vertical headroom is not present in the 2D boundary, so it must be baked.)
 - The `index` is a 1-stud spatial hash; a key can hold **several surfels at different heights** (multi-level floors), for neighbour lookups in the boundary/polygonization stage.
 - Cost: full bake (gather + SVO + extract) ≈ **1.7 s** for the 177-part test scene → ~49.5k surfels.
 
-### Boundaries (next)
+### Boundaries (implemented — being corrected)
 
-The floor filter answers only *"is there floor here?"*. Boundaries come from geometry, from two sources:
+The floor filter answers only *"is there floor here?"*. Boundaries come from **geometry**, from two sources — and the key correction is that **each source uses a different derivation**. The first implementation derived *both* from the surfel field, which is wrong for walls (see the staircase failure mode below).
 
-- **Vertical faces (walls/obstacles).** For each blocking face:
-  - **Bottom edge** → project down to the floor to get the boundary line, then clip away excess that runs into other parts or into walkable space.
+**Unifying principle — every part-derived edge is a surface intersection.** An edge from a part is the line where the part's face **intersects the walkable surface**, computed as `{face plane} ∩ {floor-part top}` and clipped to their overlapping footprints — *not* the part's bottom edge and *not* a naive downward projection. Walls and clipramps frequently pierce *through* the floor, so their bottom sits in dead space below where anyone walks; the edge belongs where the part crosses the surface you actually stand on. Classify the resulting segment *after* computing it: non-walkable on the far side → a hard **boundary** (wall); walkable on both sides → a **seam** (a clipramp meeting a floor; later a portal). Two consequences:
+
+- A part can cross **several** walkable surfaces at different heights (a wall piercing two floors) → one segment per layer, at each layer's height.
+- A part crossing a floor **seam** (two abutting slabs, a step) splits into one segment per floor part beneath it.
+
+- **Walls — from the wall's face, NOT the surfel field.** Apply the intersection construction above → **one clean segment per face/floor pair**, endpoints on the real intersection. A straight wall yields a single two-vertex edge, never a run of grid steps. Then:
   - **Top edge** → decide whether the face is a *true* blocker at all. A face with a ceiling/part directly above and no walkable space on top is a real wall (carve it); a low lip you step over, or an overhang you pass under, is not.
   - A face contributes a boundary only if it actually blocks the agent: height exceeds step-up **and** clearance below its top is less than agent height.
-- **Floor-extent edges.** Not every boundary is a wall. Rooftops, ledges, and cliffs are bounded by the floor simply *ending*. Wherever the floor filter ends with a drop beyond step height and no wall, that outer edge is itself a boundary.
+  - **Clip** where the segment runs into other parts or into walkable space.
+- **Dropoffs — surfel-seeded, then simplified + snapped.** Rooftops, ledges, and cliffs are bounded by the floor simply *ending*; there is no part face to read, so the trace *must* seed from the surfel field wherever the floor ends with a drop beyond step height and no wall. But the raw surfel trace is grid-quantized, so it is not the final edge:
+  - **Simplify** the polyline (collinear-merge / Douglas–Peucker) so a straight ledge collapses to a straight run instead of a staircase.
+  - **Snap** vertices to a nearby part edge when one lies within ~1 stud, so a ledge backed by real geometry lands on it. Only genuinely organic edges keep a stepped shape, and even those are smoothed.
+
+**Failure mode to avoid — the staircase.** Deriving *wall* boundaries from surfel adjacency (scanning where walkable cells stop) quantizes every edge to the 1-stud grid: a single straight wall becomes ~20 stepped micro-segments hugging the voxel field instead of two endpoints on the real face. This was the first-pass result. Walls must come from the face; only true open dropoffs may seed from surfels, and those get simplified. Expected output is sparse polylines with vertices only at real corners.
+
+**Debug viz legend:** **red = wall boundary**, **cyan = dropoff edge**.
 
 **Robustness note:** tracing boundaries geometrically across a town of intersecting, overlapping destructible parts is where the bugs will live (coplanar faces, T-junctions, parts poking into each other). Budget for solid clip/merge handling.
 
@@ -72,13 +81,17 @@ split if  floor-deviation > 2 studs   (discrete step tolerance)
        OR clearance changes           (e.g. open air vs. a crawl tunnel)
 ```
 
-Slopes use the angle limit rather than the ±2 deviation, so a long ramp is not merged into flat floor. Small polygons are reserved for genuinely tricky geometry. Note there is **no width split** — narrow corridors get their own polygons automatically because the *walls* (boundary edges) bound them; a corridor is thin because its two boundary edges are close, not because of any width annotation.
+"Clearance changes" concretely means two things. **Hard splits on the movement-mode tier thresholds** (3 = crouch, 4 = min standing height; see Agents & sizing): each poly bakes its **min clearance** and gets one homogeneous traversal class, so walk vs crouch vs crawl space is **resolved at the navmesh stage** — the pathfinder filters/costs whole polys and never re-derives headroom per step. **Soft splits within the walk band** on clearance deviation beyond a tolerance (~2 studs, mirroring floor-dev), so the baked per-poly min stays representative and `poly_min_clearance >= agent_standing_height` remains exact-not-overconservative for the 4–7 scaling walkers (a low-ceiling pocket must not drag down the min of a huge open poly). A walk→crawl transition is a **clearance seam** (poly split), not a wall or dropoff — the boundary stage emits no edge there.
+
+Slopes use the angle limit rather than the ±2 deviation, so a long ramp is not merged into flat floor. Small polygons are reserved for genuinely tricky geometry. **The generator has no width concept, so splits are never width-driven** — a narrow corridor already gets its own polygons simply because its two boundary edges are close.
 
 ## Agents & sizing
 
-Two dimensions decide whether an agent fits: **clearance** (vertical) and **width** (`2 × radius`). Clearance is a **baked** per-surfel/per-polygon annotation (it isn't in the 2D geometry). Width is **not** baked — it comes from the polygon/portal geometry itself at query time (a portal's shared-edge length; a corridor poly's opposing boundary edges).
+Two dimensions decide whether an agent fits: **clearance** (vertical) and **width** (`2 × radius`, horizontal). Only **clearance** is baked — a per-surfel/per-polygon annotation, because vertical headroom can't be recovered from the 2D geometry. **Width is never baked and is not a generation concern at all.** It is resolved entirely at **pathfinding time**, by the pathfinder, using the navmesh (portal shared-edge length, a poly's opposing boundary edges) together with **SVO** solid queries. The generator emits nothing width-related — no field, no annotation, no split.
 
-### Detail band (~1–9 studs) — one annotated mesh
+**Height tiers:** normal NPCs stand **4–7 studs**; **8+ is the "giant" tier** (coarse mesh, see below). The cutoff is configurable per project but 8 is the default boundary between the two.
+
+### Detail band (~1.5–7 studs standing) — one annotated mesh
 
 A single mesh with per-polygon/per-edge `clearance`. Any agent filters the shared mesh at query time:
 
@@ -86,21 +99,21 @@ A single mesh with per-polygon/per-edge `clearance`. Any agent filters the share
 skip edge if clearance < agent_height  OR  portal_edge_length < 2 * agent_radius
 ```
 
-This is **continuous in agent size** — no height buckets. The mesh only splits where real geometry changes clearance/width. Because spaces are authored to their inhabitants (and larger races' architecture inherently accommodates humans), the common case — a ~5-stud human/player — filters almost nothing, so the filter is effectively free on the hot path. Its real work is limited to crawl/crouch spaces, giants, and post-destruction changes.
+This is **continuous in agent size** — no height buckets. The mesh only splits where real geometry changes clearance. Because spaces are authored to their inhabitants (and larger races' architecture inherently accommodates humans), the common case — a ~5-stud human/player — filters almost nothing, so the filter is effectively free on the hot path. Its real work is limited to crawl/crouch spaces, giants, and post-destruction changes.
 
 **Crouch & crawl are edge movement-modes, not separate meshes.** Each edge carries its min-clearance; an agent picks the cheapest mode that fits, with a speed/cost penalty so A\* prefers standing routes:
 
 ```
-walk   if clearance >= 5
-crouch if clearance >= 3   (cost penalty, triggers crouch anim)
-crawl  if clearance >= 1.5 (larger penalty, triggers crawl anim)
+walk   if clearance >= agent_standing_height   (4–7, scales with the agent)
+crouch if clearance >= 3    (cost penalty, triggers crouch anim)
+crawl  if clearance >= 1.5  (larger penalty, triggers crawl anim)
 ```
 
-### Giant tier (~9+ studs, configurable) — coarse mesh
+### Giant tier (~8+ studs, configurable) — coarse mesh
 
 A separate coarse mesh of few big polygons over open areas only. Giants don't thread doorways or route around small obstacles — they **destroy** them. A large creature walking into a breakable simply triggers the destruction system (enable portals, spawn the debris carve) instead of avoiding it. The coarse mesh and the destruction pipeline reinforce each other.
 
-The **9-stud cutoff is configurable** per project.
+The **8-stud cutoff is configurable** per project.
 
 ## Destruction
 
@@ -112,7 +125,7 @@ Because breakables are authored, the complete set of post-destruction topologies
 
 - **Phantom polygon(s)** — the walkable floor patch inside the part's footprint that exists only once the part is gone.
 - **Portal links** — the shared edges connecting the phantom poly to neighbouring polys, including the left/right gap endpoints so the funnel/string-pull steers cleanly through the opening.
-- **Stateful clearance/width** — a destroyed ceiling raises clearance below; toggled with the record.
+- **Stateful clearance** — a destroyed ceiling raises clearance below; toggled with the record.
 
 At runtime, destroying a part is `record.enabled = true`. A\* then sees the portal. No generation, no re-triangulation, no runtime SVO traversal during search.
 
@@ -126,11 +139,11 @@ Because boundaries are derived from wall footprints, a breakable wall's footprin
 
 ### Addition (settled debris) — the one runtime exception
 
-Falling parts settle at physics-determined positions that cannot be pre-baked. When a part anchors (unsupported parts fall, then despawn or anchor for optimization), it stamps **one bounded temp-obstacle carve** onto the baked mesh: mark blocked and reduce local clearance/width. This is Detour-style — O(1)-ish, bounded, **not** a rebuild. It is the single sanctioned runtime mutation of the navmesh.
+Falling parts settle at physics-determined positions that cannot be pre-baked. When a part anchors (unsupported parts fall, then despawn or anchor for optimization), it stamps **one bounded temp-obstacle carve** onto the baked mesh: mark blocked and reduce local clearance. This is Detour-style — O(1)-ish, bounded, **not** a rebuild. It is the single sanctioned runtime mutation of the navmesh.
 
 ## Open items
 
 - **Debris carve fidelity** — confirm the carve shape (box/cylinder) and how long anchored debris persists before despawn.
 - **Compound-breakable baking** — decide whether pairwise combination records are needed for the intended layouts.
-- **SVO resolution** — verify the octree is fine enough to extract clearance/width at the precision surface extraction wants (~agent-radius/2), or run a finer secondary voxel field for the annotation pass.
+- **SVO resolution** — verify the octree is fine enough for the clearance annotation and for the pathfinder's runtime width queries (~agent-radius/2), or run a finer secondary voxel field.
 - **Giant tier count** — one coarse mesh, or a couple of buckets across the 9–50 stud range.
