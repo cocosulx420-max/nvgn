@@ -49,7 +49,12 @@ FloorData = { surfels = {...}, index = {"x:z" -> {surfels}}, config }
 
 The floor filter answers only *"is there floor here?"*. Boundaries come from **geometry**, from two sources — and the key correction is that **each source uses a different derivation**. The first implementation derived *both* from the surfel field, which is wrong for walls (see the staircase failure mode below).
 
-- **Walls — from the wall's face, NOT the surfel field.** For each blocking vertical face, take its **bottom edge** and project to floor height → **one clean segment per face**, with endpoints at the face corners. A straight wall yields a single two-vertex edge, never a run of grid steps. Then:
+**Unifying principle — every part-derived edge is a surface intersection.** An edge from a part is the line where the part's face **intersects the walkable surface**, computed as `{face plane} ∩ {floor-part top}` and clipped to their overlapping footprints — *not* the part's bottom edge and *not* a naive downward projection. Walls and clipramps frequently pierce *through* the floor, so their bottom sits in dead space below where anyone walks; the edge belongs where the part crosses the surface you actually stand on. Classify the resulting segment *after* computing it: non-walkable on the far side → a hard **boundary** (wall); walkable on both sides → a **seam** (a clipramp meeting a floor; later a portal). Two consequences:
+
+- A part can cross **several** walkable surfaces at different heights (a wall piercing two floors) → one segment per layer, at each layer's height.
+- A part crossing a floor **seam** (two abutting slabs, a step) splits into one segment per floor part beneath it.
+
+- **Walls — from the wall's face, NOT the surfel field.** Apply the intersection construction above → **one clean segment per face/floor pair**, endpoints on the real intersection. A straight wall yields a single two-vertex edge, never a run of grid steps. Then:
   - **Top edge** → decide whether the face is a *true* blocker at all. A face with a ceiling/part directly above and no walkable space on top is a real wall (carve it); a low lip you step over, or an overhang you pass under, is not.
   - A face contributes a boundary only if it actually blocks the agent: height exceeds step-up **and** clearance below its top is less than agent height.
   - **Clip** where the segment runs into other parts or into walkable space.
@@ -84,7 +89,9 @@ Slopes use the angle limit rather than the ±2 deviation, so a long ramp is not 
 
 Two dimensions decide whether an agent fits: **clearance** (vertical) and **width** (`2 × radius`). Clearance is a **baked** per-surfel/per-polygon annotation (it isn't in the 2D geometry). Width is **not** baked — it comes from the polygon/portal geometry itself at query time (a portal's shared-edge length; a corridor poly's opposing boundary edges).
 
-### Detail band (~1–9 studs) — one annotated mesh
+**Height tiers:** normal NPCs stand **4–7 studs**; **8+ is the "giant" tier** (coarse mesh, see below). The cutoff is configurable per project but 8 is the default boundary between the two.
+
+### Detail band (~1.5–7 studs standing) — one annotated mesh
 
 A single mesh with per-polygon/per-edge `clearance`. Any agent filters the shared mesh at query time:
 
@@ -97,16 +104,16 @@ This is **continuous in agent size** — no height buckets. The mesh only splits
 **Crouch & crawl are edge movement-modes, not separate meshes.** Each edge carries its min-clearance; an agent picks the cheapest mode that fits, with a speed/cost penalty so A\* prefers standing routes:
 
 ```
-walk   if clearance >= 5
-crouch if clearance >= 3   (cost penalty, triggers crouch anim)
-crawl  if clearance >= 1.5 (larger penalty, triggers crawl anim)
+walk   if clearance >= agent_standing_height   (4–7, scales with the agent)
+crouch if clearance >= 3    (cost penalty, triggers crouch anim)
+crawl  if clearance >= 1.5  (larger penalty, triggers crawl anim)
 ```
 
-### Giant tier (~9+ studs, configurable) — coarse mesh
+### Giant tier (~8+ studs, configurable) — coarse mesh
 
 A separate coarse mesh of few big polygons over open areas only. Giants don't thread doorways or route around small obstacles — they **destroy** them. A large creature walking into a breakable simply triggers the destruction system (enable portals, spawn the debris carve) instead of avoiding it. The coarse mesh and the destruction pipeline reinforce each other.
 
-The **9-stud cutoff is configurable** per project.
+The **8-stud cutoff is configurable** per project.
 
 ## Destruction
 
