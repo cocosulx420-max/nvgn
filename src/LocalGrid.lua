@@ -77,10 +77,19 @@ local function groupByPart(surfels: {any}): { [BasePart]: {any} }
 	return byPart
 end
 
--- Pick a block's walkable top face: the +/- principal axis whose world normal
--- points most upward. Returns the surface normal, its half-extent, and the two
--- in-plane axes (each { dir, ext }).
-local function topFace(part: BasePart)
+-- Average the surfel normals to get the true walkable-face direction.
+local function avgNormal(surfels: {any}): Vector3
+	local s = Vector3.zero
+	for _, sf in ipairs(surfels) do s += sf.normal end
+	return (s.Magnitude > 1e-4) and s.Unit or Vector3.yAxis
+end
+
+-- Pick a block's walkable face: the +/- principal axis closest to the actual
+-- surface normal (from the surfels), NOT the axis most world-up. A thin slab
+-- tilted past ~45deg has an edge axis with a higher Y-component than its real
+-- face normal, so a world-up heuristic collapses the grid to a 1-wide strip.
+-- Returns the surface normal, its half-extent, and the two in-plane axes.
+local function topFace(part: BasePart, surfaceN: Vector3)
 	local cf = part.CFrame
 	local sz = part.Size
 	local axes = {
@@ -88,21 +97,23 @@ local function topFace(part: BasePart)
 		{ dir = cf.UpVector,    ext = sz.Y * 0.5 },
 		{ dir = cf.RightVector:Cross(cf.UpVector), ext = sz.Z * 0.5 }, -- local Z basis
 	}
-	local bi, bn, maxY = 2, cf.UpVector, -math.huge
+	local bi, best = 2, -math.huge
 	for i, a in ipairs(axes) do
-		if a.dir.Y > maxY then maxY = a.dir.Y; bi = i; bn = a.dir end
-		if -a.dir.Y > maxY then maxY = -a.dir.Y; bi = i; bn = -a.dir end
+		local d = math.abs(a.dir:Dot(surfaceN))
+		if d > best then best = d; bi = i end
 	end
+	local a = axes[bi]
+	local n = (a.dir:Dot(surfaceN) >= 0) and a.dir or -a.dir
 	local plane = {}
-	for i, a in ipairs(axes) do
-		if i ~= bi then plane[#plane + 1] = a end
+	for i, ax in ipairs(axes) do
+		if i ~= bi then plane[#plane + 1] = ax end
 	end
-	return bn, axes[bi].ext, plane[1], plane[2]
+	return n, a.ext, plane[1], plane[2]
 end
 
--- Block part: surface-aligned grid over the principal top face.
-local function buildBlockGrid(part: BasePart, c: any, filterAll: RaycastParams): Grid
-	local n, nExt, ua, va = topFace(part)
+-- Block part: surface-aligned grid over the principal walkable face.
+local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams): Grid
+	local n, nExt, ua, va = topFace(part, avgNormal(surfels))
 	local u, uExt = ua.dir, ua.ext
 	local v, vExt = va.dir, va.ext
 	local surfaceCenter = part.Position + n * nExt
@@ -175,7 +186,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	for part, sfs in pairs(byPart) do
 		local g: Grid
 		if isBlock(part) then
-			g = buildBlockGrid(part, c, filterAll)
+			g = buildBlockGrid(part, sfs, c, filterAll)
 			nBlock += 1
 		else
 			g = buildFallbackGrid(part, sfs, c)
