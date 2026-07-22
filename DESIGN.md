@@ -45,15 +45,21 @@ FloorData = { surfels = {...}, index = {"x:z" -> {surfels}}, config }
 - The `index` is a 1-stud spatial hash; a key can hold **several surfels at different heights** (multi-level floors), for neighbour lookups in the boundary/polygonization stage.
 - Cost: full bake (gather + SVO + extract) ≈ **1.7 s** for the 177-part test scene → ~49.5k surfels.
 
-### Boundaries (next)
+### Boundaries (implemented — being corrected)
 
-The floor filter answers only *"is there floor here?"*. Boundaries come from geometry, from two sources:
+The floor filter answers only *"is there floor here?"*. Boundaries come from **geometry**, from two sources — and the key correction is that **each source uses a different derivation**. The first implementation derived *both* from the surfel field, which is wrong for walls (see the staircase failure mode below).
 
-- **Vertical faces (walls/obstacles).** For each blocking face:
-  - **Bottom edge** → project down to the floor to get the boundary line, then clip away excess that runs into other parts or into walkable space.
+- **Walls — from the wall's face, NOT the surfel field.** For each blocking vertical face, take its **bottom edge** and project to floor height → **one clean segment per face**, with endpoints at the face corners. A straight wall yields a single two-vertex edge, never a run of grid steps. Then:
   - **Top edge** → decide whether the face is a *true* blocker at all. A face with a ceiling/part directly above and no walkable space on top is a real wall (carve it); a low lip you step over, or an overhang you pass under, is not.
   - A face contributes a boundary only if it actually blocks the agent: height exceeds step-up **and** clearance below its top is less than agent height.
-- **Floor-extent edges.** Not every boundary is a wall. Rooftops, ledges, and cliffs are bounded by the floor simply *ending*. Wherever the floor filter ends with a drop beyond step height and no wall, that outer edge is itself a boundary.
+  - **Clip** where the segment runs into other parts or into walkable space.
+- **Dropoffs — surfel-seeded, then simplified + snapped.** Rooftops, ledges, and cliffs are bounded by the floor simply *ending*; there is no part face to read, so the trace *must* seed from the surfel field wherever the floor ends with a drop beyond step height and no wall. But the raw surfel trace is grid-quantized, so it is not the final edge:
+  - **Simplify** the polyline (collinear-merge / Douglas–Peucker) so a straight ledge collapses to a straight run instead of a staircase.
+  - **Snap** vertices to a nearby part edge when one lies within ~1 stud, so a ledge backed by real geometry lands on it. Only genuinely organic edges keep a stepped shape, and even those are smoothed.
+
+**Failure mode to avoid — the staircase.** Deriving *wall* boundaries from surfel adjacency (scanning where walkable cells stop) quantizes every edge to the 1-stud grid: a single straight wall becomes ~20 stepped micro-segments hugging the voxel field instead of two endpoints on the real face. This was the first-pass result. Walls must come from the face; only true open dropoffs may seed from surfels, and those get simplified. Expected output is sparse polylines with vertices only at real corners.
+
+**Debug viz legend:** **red = wall boundary**, **cyan = dropoff edge**.
 
 **Robustness note:** tracing boundaries geometrically across a town of intersecting, overlapping destructible parts is where the bugs will live (coplanar faces, T-junctions, parts poking into each other). Budget for solid clip/merge handling.
 
