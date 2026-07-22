@@ -43,7 +43,7 @@ FloorData = { surfels = {...}, index = {"x:z" -> {surfels}}, config }
 - The `index` is a 1-stud spatial hash; a key can hold **several surfels at different heights** (multi-level floors), for neighbour lookups in the boundary/polygonization stage.
 - Cost: full bake (gather + SVO + extract) ≈ **1.7 s** for the 177-part test scene → ~49.5k surfels.
 
-### Boundaries (implemented — being corrected)
+### Boundaries (stage 1 construction implemented; classification pending)
 
 The floor filter answers only *"is there floor here?"*. Boundaries come from **geometry**, from two sources — and the key correction is that **each source uses a different derivation**. The first implementation derived *both* from the surfel field, which is wrong for walls (see the staircase failure mode below).
 
@@ -55,7 +55,8 @@ The floor filter answers only *"is there floor here?"*. Boundaries come from **g
 - **Walls — from the wall's face, NOT the surfel field.** Apply the intersection construction above → **one clean segment per face/floor pair**, endpoints on the real intersection. A straight wall yields a single two-vertex edge, never a run of grid steps. Then:
   - **Top edge** → decide whether the face is a *true* blocker at all. A face with a ceiling/part directly above and no walkable space on top is a real wall (carve it); a low lip you step over, or an overhang you pass under, is not.
   - A face contributes a boundary only if it actually blocks the agent: height exceeds step-up **and** clearance below its top is less than agent height.
-  - **Clip** where the segment runs into other parts or into walkable space.
+  - **Clip to exposed surface (implemented: exposure trimming).** A plane∩rect segment can be geometrically real yet unstandable — an interior slab embedded through a wall crosses the wall's *outer* face at mid-height ("edge in the middle of a wall"), and a partially buried part's edges continue through solid. Every raw span is sampled against the floor's **local grid** (the clearance-validated record of where standable surface exists) and only grid-supported runs are emitted; each cut endpoint is then **snapped onto the occluding part's face plane**. The grid decides *where* an edge may exist, geometry decides *exactly* where it ends — vertices stay on real geometry, fully unsupported spans vanish.
+- **Rims — the floor's own top edges, for free.** The same intersection construction with the blocker being the floor itself (its side faces ∩ its own top plane) yields the part's exact top-face perimeter: the candidate set for dropoffs and the snap targets for surfel-seeded traces. Exposure trimming applies equally — a rim span buried in a hillside or under an abutting structure is no edge.
 - **Dropoffs — surfel-seeded, then simplified + snapped.** Rooftops, ledges, and cliffs are bounded by the floor simply *ending*; there is no part face to read, so the trace *must* seed from the surfel field wherever the floor ends with a drop beyond step height and no wall. But the raw surfel trace is grid-quantized, so it is not the final edge:
   - **Simplify** the polyline (collinear-merge / Douglas–Peucker) so a straight ledge collapses to a straight run instead of a staircase.
   - **Snap** vertices to a nearby part edge when one lies within ~1 stud, so a ledge backed by real geometry lands on it. Only genuinely organic edges keep a stepped shape, and even those are smoothed.

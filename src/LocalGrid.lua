@@ -285,7 +285,8 @@ function LocalGrid.visualize(data: any, parent: Instance?)
 			end
 			dot.Size = Vector3.new(w * step, 0.1, w * step)
 			dot.Color = Color3.fromHSV(hue, sat, v)
-			dot.Material = Enum.Material.Neon
+			-- matte, so the neon Boundary edges pop over the grid layer
+			dot.Material = Enum.Material.SmoothPlastic
 			if not g.fallback and g.n then
 				dot.CFrame = CFrame.fromMatrix(cell.pos, g.u, g.n)
 			else
