@@ -251,6 +251,10 @@ end
 
 -- Debug viz: one neon tile per cell, colored per-part, oriented to the surface
 -- (block grids) so alignment is eyeball-able. Fallback parts are desaturated.
+-- Traversal class (height tiers) is encoded in brightness + size — walk
+-- (clearance >= 4, min standing height) full-bright 0.9-wide, crouch (>= 3)
+-- dimmer 0.7-wide, crawl (>= 1.5) dim ember 0.55-wide — so real walking space
+-- and crawlspace are distinguishable at a glance. Dot Name = clearance.
 function LocalGrid.visualize(data: any, parent: Instance?)
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
@@ -266,18 +270,28 @@ function LocalGrid.visualize(data: any, parent: Instance?)
 	for part, g in pairs(data.grids) do
 		i += 1
 		local hue = (i * 0.61803398875) % 1
-		local col = Color3.fromHSV(hue, g.fallback and 0.3 or 0.9, 1)
+		local sat = g.fallback and 0.3 or 0.9
 		local pf = Instance.new("Folder"); pf.Name = part.Name; pf.Parent = folder
 		for _, cell in ipairs(g.cells) do
 			local dot = Instance.new("Part")
 			dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
-			dot.Size = Vector3.new(0.9 * step, 0.1, 0.9 * step)
-			dot.Color = col; dot.Material = Enum.Material.Neon
+			local w, v
+			if cell.clearance >= 4 then
+				w, v = 0.9, 1
+			elseif cell.clearance >= 3 then
+				w, v = 0.7, 0.55
+			else
+				w, v = 0.55, 0.28
+			end
+			dot.Size = Vector3.new(w * step, 0.1, w * step)
+			dot.Color = Color3.fromHSV(hue, sat, v)
+			dot.Material = Enum.Material.Neon
 			if not g.fallback and g.n then
 				dot.CFrame = CFrame.fromMatrix(cell.pos, g.u, g.n)
 			else
 				dot.CFrame = CFrame.new(cell.pos)
 			end
+			dot.Name = string.format("c%.1f", cell.clearance)
 			dot.Parent = pf
 		end
 	end
