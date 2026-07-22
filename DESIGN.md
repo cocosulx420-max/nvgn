@@ -81,6 +81,8 @@ split if  floor-deviation > 2 studs   (discrete step tolerance)
        OR clearance changes           (e.g. open air vs. a crawl tunnel)
 ```
 
+"Clearance changes" concretely means two things. **Hard splits on the movement-mode tier thresholds** (3 = crouch, 4 = min standing height; see Agents & sizing): each poly bakes its **min clearance** and gets one homogeneous traversal class, so walk vs crouch vs crawl space is **resolved at the navmesh stage** — the pathfinder filters/costs whole polys and never re-derives headroom per step. **Soft splits within the walk band** on clearance deviation beyond a tolerance (~2 studs, mirroring floor-dev), so the baked per-poly min stays representative and `poly_min_clearance >= agent_standing_height` remains exact-not-overconservative for the 4–7 scaling walkers (a low-ceiling pocket must not drag down the min of a huge open poly). A walk→crawl transition is a **clearance seam** (poly split), not a wall or dropoff — the boundary stage emits no edge there.
+
 Slopes use the angle limit rather than the ±2 deviation, so a long ramp is not merged into flat floor. Small polygons are reserved for genuinely tricky geometry. **The generator has no width concept, so splits are never width-driven** — a narrow corridor already gets its own polygons simply because its two boundary edges are close.
 
 ## Agents & sizing
