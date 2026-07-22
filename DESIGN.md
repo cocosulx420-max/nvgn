@@ -43,7 +43,9 @@ FloorData = { surfels = {...}, index = {"x:z" -> {surfels}}, config }
 - The `index` is a 1-stud spatial hash; a key can hold **several surfels at different heights** (multi-level floors), for neighbour lookups in the boundary/polygonization stage.
 - Cost: full bake (gather + SVO + extract) ≈ **1.7 s** for the 177-part test scene → ~49.5k surfels.
 
-### Boundaries (stage 1 construction implemented; classification pending)
+### Boundaries (v1 implemented — **TEMPORARILY DISABLED**, alternative approach being explored)
+
+> **STATUS (2026-07-22):** `src/Boundary.lua` implements the full pipeline described below — exact segment construction, probe-based classification (wall/seam/dropoff/internal/void), exposure trimming, uncovered-coverage tracing (terrain cliffs), collinear merging, endpoint welding and dangling-end extension. It produces closed, correctly-classed chains on the whole test scene (457 edges, ~0.7s), but getting there took **twelve rounds of case-by-case probe fixes** (inside-origin raycasts, corner evidence bleed, folds, thick pitched planks, buried rims, weld drift…). The per-sample physics-probe classification is judged **too fragile to build on**: every new authoring pattern found a new hole. The module is kept as a checkpoint and as a library of reusable pieces (plane∩rect construction, exposure oracle, chain-closure passes), but it is **not** the path forward — a different approach to the staircasing/boundary problem is being designed to replace the classification layer.
 
 The floor filter answers only *"is there floor here?"*. Boundaries come from **geometry**, from two sources — and the key correction is that **each source uses a different derivation**. The first implementation derived *both* from the surfel field, which is wrong for walls (see the staircase failure mode below).
 
