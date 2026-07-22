@@ -112,7 +112,7 @@ local function topFace(part: BasePart, surfaceN: Vector3)
 end
 
 -- Block part: surface-aligned grid over the principal walkable face.
-local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams): Grid
+local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams): Grid
 	local n, nExt, ua, va = topFace(part, avgNormal(surfels))
 	local u, uExt = ua.dir, ua.ext
 	local v, vExt = va.dir, va.ext
@@ -140,8 +140,31 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 			if not res then continue end
 			local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
 			if not ((slope <= c.maxSlope) or isClip(part)) then continue end
+			-- Clearance. A raycast NEVER hits a part its origin is inside, so ray
+			-- logic alone cannot detect an embedded origin (wall flush on the floor,
+			-- buried overlap region, curved union — two-ray probing leaks on all of
+			-- these). Precise overlap probe first: any foreign solid crossing
+			-- [0.1, minClearance] above the surface means true headroom < minClearance
+			-- -> dead cell. Host is excluded: a Block is convex, so its own solid can
+			-- never sit above its own top face. Only a clear probe guarantees the
+			-- up-ray origin is outside every collider, making its distance exact.
+			probe.CFrame = CFrame.new(res.Position + UP * (0.1 + (c.minClearance - 0.1) * 0.5))
+			local blocked = false
+			for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
+				if hit ~= part then blocked = true; break end
+			end
+			if blocked then continue end
 			local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
 			local clearance = upRes and upRes.Distance or c.clearCap
+			-- Terrain is not in `parts` (never walkable) but still blocks headroom;
+			-- overlap queries are parts-only, so probe it with a terrain-only ray
+			-- pair (down-ray catches the embedded-origin case for blobs on floors).
+			local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, rpTerrain)
+			if tUp then
+				clearance = math.min(clearance, tUp.Distance)
+			elseif workspace:Raycast(res.Position + UP * c.clearCap, -UP * (c.clearCap - 0.25), rpTerrain) then
+				clearance = 0
+			end
 			if clearance < c.minClearance then continue end
 			local cell: Cell = {
 				ui = iu, vi = iv, pos = res.Position, normal = res.Normal,
@@ -180,13 +203,28 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	filterAll.FilterType = Enum.RaycastFilterType.Include
 	filterAll.FilterDescendantsInstances = parts
 
+	-- Embedded-origin probe shared by all block grids (see clearance note in
+	-- buildBlockGrid).
+	local probe = Instance.new("Part")
+	probe.Name = "NVGN_ClearProbe"
+	probe.Size = Vector3.new(0.05, c.minClearance - 0.1, 0.05)
+	probe.Anchored = true; probe.CanCollide = false; probe.CanQuery = false; probe.CanTouch = false
+	probe.Transparency = 1
+	probe.Parent = workspace
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Include
+	op.FilterDescendantsInstances = parts
+	local rpTerrain = RaycastParams.new()
+	rpTerrain.FilterType = Enum.RaycastFilterType.Include
+	rpTerrain.FilterDescendantsInstances = { workspace.Terrain }
+
 	local byPart = groupByPart(floorData.surfels)
 	local grids: { [BasePart]: Grid } = {}
 	local nBlock, nFallback, nCells = 0, 0, 0
 	for part, sfs in pairs(byPart) do
 		local g: Grid
 		if isBlock(part) then
-			g = buildBlockGrid(part, sfs, c, filterAll)
+			g = buildBlockGrid(part, sfs, c, filterAll, probe, op, rpTerrain)
 			nBlock += 1
 		else
 			g = buildFallbackGrid(part, sfs, c)
@@ -195,6 +233,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 		grids[part] = g
 		nCells += #g.cells
 	end
+	probe:Destroy()
 
 	return {
 		grids = grids, config = c,
