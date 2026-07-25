@@ -121,6 +121,12 @@ local DEFAULT = {
 	-- parallel for their intersection to be trusted: the line's position blows
 	-- up with a fraction of a degree of tilt. ~0.26 ≈ 15°.
 	tierMinTilt = 0.26,
+	-- How far past a floor's OWN rim to look for a neighbour that carries on.
+	-- Cross-grid coverage (above) asks the LATTICE, one full step out, which
+	-- silently assumes the neighbour's lattice is in phase with ours — exactly
+	-- what is false between two parts at different yaws. Ask the geometry
+	-- instead, a hair past the rim, where phase cannot enter.
+	rimProbe = 0.05,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -329,13 +335,45 @@ local function sampleFrontier(data: any, c: any): ({Sample}, any)
 						end
 					end
 					if not class then
+						local rimP = (g.center :: Vector3) + dir * exts[di]
+						-- Before claiming the world ends at this part's rim, look
+						-- just PAST it. A neighbouring slab that carries on flush
+						-- owns whatever boundary lies out there; our rim is then an
+						-- internal overlap, and drawing it produces a duplicate
+						-- line a fraction of a stud inside the real one and skewed
+						-- by the angle between the two parts — a stub that no
+						-- closure pass can reconcile, because it belongs to a
+						-- different floor and a different line.
+						--
+						-- Cross-grid coverage cannot catch this. It samples one
+						-- full step out, where the neighbour has already ended, and
+						-- the neighbour's lattice carries no cell centre inside the
+						-- narrow sliver that overhangs us. Geometry has no phase
+						-- problem.
+						--
+						-- Only a MESHED neighbour may suppress us: a fallback
+						-- (union/mesh) floor emits no edges of its own, so deferring
+						-- to one would open a hole rather than move a line.
+						local tPast = (rimP - cell.pos):Dot(dir) + c.rimProbe
+						local past = workspace:Raycast(
+							cell.pos + dir * tPast + UP * c.seamEps,
+							-UP * (c.seamEps + c.seamDrop), rp)
+						if past then
+							local og = data.grids[past.Instance]
+							local sl = math.deg(math.acos(math.clamp(past.Normal:Dot(UP), -1, 1)))
+							if og and not og.fallback and sl <= c.maxSlope
+								and math.abs(past.Position.Y - cell.pos.Y) <= c.seamEps then
+								stats.fictional += 1
+								continue
+							end
+						end
 						-- A genuine ledge. The floor ENDS here, so the exact line
 						-- is the part's own rim plane — which also fixes the
 						-- lattice under-covering the rim when the part size is
 						-- not a whole number of cells.
 						class = "dropoff"
 						planeN = dir
-						planeP = (g.center :: Vector3) + dir * exts[di]
+						planeP = rimP
 						source = part
 					end
 				end
