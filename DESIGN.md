@@ -69,11 +69,62 @@ The floor filter answers only *"is there floor here?"*. Boundaries come from **g
 
 **Robustness note:** tracing boundaries geometrically across a town of intersecting, overlapping destructible parts is where the bugs will live (coplanar faces, T-junctions, parts poking into each other). Budget for solid clip/merge handling.
 
+### Boundaries v2 — node graph, attribution, geometry stealing (in design, 2026-07-25)
+
+The replacement for v1's per-sample probe classification. The organising principle is a **strict division of labour**, and every v1 failure traces back to violating it:
+
+> **Nodes are a selection mask and a connectivity graph. They are never geometry.**
+> **Part geometry is the only source of edge lines.**
+
+The moment a node position is used *as* a line, the 1-stud lattice is baked into the output and the staircase is unavoidable. Nodes decide *whether* an edge exists and *which stretch* of it is real; the blocking part decides *exactly where it lies*.
+
+**Substrate — dead cells carry their killer.** The LocalGrid bake persists killed cells (`grid.dead` / `deadIndex`) with the part that killed them, captured at kill time from the occupancy probe, the clearance up-ray or the terrain pair. No re-probing, and no inside-origin exposure. Test scene: 18,190 dead cells, 112 distinct killers. This attribution is what makes geometry stealing possible later, and it is nearly free.
+
+**Stage order.** Each stage exists to feed the next one trustworthy input; running them out of order means classifying against neighbour data already known to be wrong.
+
+1. **Cross-grid adjacency.** Grids are per-part, so a cell at the rim of part B has an "absent" neighbour even when part A covers that spot at the same height. These are *fictional* boundaries, and they are line-breaking: a false dropoff one row behind a real one puts a branch or a jog into any polyline fit. Before calling a direction absent, ask whether **any** grid has a live node there, not just the host. This deletes most of the seam class structurally instead of patching it with smarter probes.
+2. **Per-direction classification.** A class belongs to the **(node, direction) pair** — the cell-boundary segment — not to the node. A stair tread is simultaneously a wall uphill and a dropoff downhill; collapsing that to one label per node with `wall > dropoff` precedence destroys the dropoff wherever a tread is narrow enough for one cell to touch both, which is most treads.
+3. **Node welding.** Collapse coincident lattices from overlapping parts into one node set. This is **simplification, not correctness** — stage 1 already fixed the truth. Cluster-to-centroid rather than pairwise "nearest neighbour" averaging: pairwise is order-dependent (if A's nearest is B but B's nearest is C the result depends on iteration order) and leaves a stray node whenever three parts overlap. Gates before any merge: heights flush within ~0.3, compatible normals, and **no geometry between the two nodes** — without all three, a floor node merges with a ramp node and the result floats in space.
+4. **Attribution.** Record the blocking part on every wall edge. For a dead neighbour it is already stored (`killer`); for an absent-but-occupied neighbour the occupancy probe already returns it and we currently discard it. Free either way.
+5. **Geometry stealing.** Replace each attributed run with an exact line.
+
+**Geometry stealing — the staircase cure.** Once an edge knows its floor `F` and blocker `K`, the clean line is the **plane–plane intersection** `{K's blocking face} ∩ {F's top}`. That is exact: no lattice, no sampling, no quantization. A rotated wall yields a perfectly straight diagonal because the face plane lives in K's frame and F's lattice never enters the computation — the staircase is not smoothed, it is never generated. The contiguous run of wall edges sharing `(F, K)` supplies only the **extent**. Jagged mask, clean line. Where a run's blocker changes from `K₁` to `K₂`, the corner is the intersection of the two face planes rather than a welded approximation. Dropoff edges use the same construction with `F` as its own blocker, giving F's exact top-face rim.
+
+This reuses v1's committed plane∩rect construction, but **driven by node attribution instead of enumerating every part pair** — strictly better, because attribution names exactly which pairs matter and which stretch applies.
+
+**Why not the footprint lattice for this.** `NVGN.Footprint` (built, Studio-only) recovers a cutter's true underside outline via world-vertical up-rays on a yaw-aligned lattice — origins in open air, so the inside-origin trap cannot fire — and merges boundary runs into axis-aligned runs clean in the cutter's own frame (test scene: 111 block killers → 444 runs, exactly 4 per part, 0.2 s). Measured against the cutters' real face planes the runs land at **median 0.000 / p90 0.041** studs, so it is accurate. But it carries up to ±0.5 stud of lattice quantization *by construction*, and plane∩plane has none. The footprint's job is recovering a **cutting shape** (needed for non-block and tilted cutters); for wall lines, plane intersection is both exact and simpler.
+
+**ClipRamp as a named special case.** Stairs are always authored as parts named `ClipRamp`. Round 10 deliberately removed name-matching in favour of a `steepEntry` slope-change test after a sheet named `RAMP1THIS` slipped through — the authoring guarantee is what makes name-matching safe again, and it should be recorded as a dependency on that guarantee. The end/side distinction is computable from the grid alone: the ramp's height gradient gives the slope direction, **ends** are the edges perpendicular to it (entries → seam), **sides** are parallel (classify normally). This matches the round-6 rule that you enter a ramp at its ends, never through its side mid-slope.
+
+**~~Known gap — non-block blockers.~~** *(closed by the raycast method below.)* When attribution returns Terrain or a Union there is no single face plane to *reconstruct*, so the plan was to degrade to a simplified node polyline. Asking the engine for the plane instead removes the distinction entirely.
+
+**Open decision.** Cocosulx wants the edge of a block adjacent to a clipramp classed **wall** ("a clipramp below you means you cannot fall"). This is a real exception to the round-7 rule that step tolerance is out of classification (a drop onto an adjacent surface reads *dropoff from above, wall from below*, paired by the pathfinder per agent). It needs to be scoped tightly to clipramp adjacency or it will start swallowing legitimate ledges.
+
+### Boundaries v2, stage A — raycast-derived edges (`src/Clean.lua`, built 2026-07-25)
+
+Cocosulx's refinement, and the form geometry stealing actually shipped in. Rather than reconstruct the blocker's face plane from its OBB, **fire one horizontal ray from the standable node into the blocked direction** and let the engine hand it over: `Position` (a point exactly on the blocking surface), `Normal` (its plane) and `Instance` (the blocker, for grouping), from a single call.
+
+Three properties follow, and each one deletes a class of problem rather than handling it:
+
+- **No blocker is special.** Unions, MeshParts, wedges and Terrain return a hit normal like anything else, so the "known gap" above never arises — there is no `isBlock` gate in the module. On the test scene 136 samples come off the arch Union and produce ordinary exact lines.
+- **The inside-origin trap cannot fire.** Every origin is a live node's surface, which passed LocalGrid's clearance probe and is therefore outside every collider by construction. Ray heights `{0.25, 0.75, 1.2}` all sit below `minClearance` 1.5 to keep that guarantee; nearest hit wins, so a low kerb cannot mask the wall behind it. That trap has bitten four separate probes on this project — this is the first construction where it is *excluded* rather than *guarded*.
+- **The ray classifies and measures at once.** A hit is a wall carrying its own geometry; a miss is an open edge. v1 needed a chain of bespoke probes to pick the class and a separate construction to place the line, and each new authoring pattern broke one or the other.
+
+Runs group by **(floor, blocker instance, plane)** — the plane itself, not a collinearity tolerance — and supply only the **extent**; the line remains `{hit plane} ∩ {floor top}`. Measured accuracy: hit deviation from the group plane **median 0.0000, p99 0.0001, max 0.0020** studs (the footprint lattice, for comparison, is p90 0.041 by construction).
+
+**Entries are a slope test, not a name test.** A hit whose normal is within the walkability limit did not find a wall — it grazed a **floor**. A clipramp's low end sits a hair under the ground, so the ray clips the ground's top face and v1 called the ramp entry a wall. The rule: walkable normal + flush within `seamEps` (0.3) → **seam**; beyond `seamEps` it stays a wall, preserving round 7. For ramp **tops** the ray misses, so one down-probe just past the rim (`seamDrop` 2.0) applies the same walkable-and-flush test before a dropoff is declared. The flush gate is what keeps this scoped to real entries — it reproduces round 6's end/side distinction without consulting a part name, so `RAMP1THIS` cannot slip through. Both seam kinds retain their hit and get exact plane∩plane lines. Result: all six test-scene clipramps seam at both ends, dropoff along the sides, zero ramp-vs-ground walls.
+
+**Never key on instance names.** Grouping originally keyed on `tostring(part)`, which returns the *name*: every part called `Pink` or `ClipRamp` collapsed into one group, merging runs across unrelated floors and — where interleaved samples tripped the run-gap test — shattering the remainder into 1,571 junk dropoff edges (299 after the fix). Authored scenes reuse names freely; keys must carry identity.
+
+**Still owed.** Dropoff and tier edges have no blocking face to steal, so they remain lattice polylines flagged `exact = false`: dropoffs want the same construction with `F` as its own blocker (its exact top-face rim), and `tier` — a node killed by overhead cover with nothing blocking at body height — is 6 studs of the entire test scene. Each ramp entry currently emits a **matched pair** (the ramp's seam and the adjacent floor's), correct as half-edges but needing dedup into one portal record at the weld stage. **Corner closure stays a separate pass** by design: missing corners were never caused by line derivation but by exposure trimming deleting the samples near a corner, so the fix is to intersect adjacent runs' *lines* — exact even where no sample survives — which should retire v1's weld / mergeCollinear / dangling-extension passes rather than tune them.
+
 ### Slopes, steps, and stairs
 
 - **Slope-angle limit** governs continuous inclines.
-- **±2-stud step tolerance** governs discrete steps (a normal 5-stud-tall character auto-steps a ≤2-stud lip).
+- **±2-stud step tolerance** governs discrete steps (a normal 5-stud-tall character auto-steps a ≤2-stud lip). **This is a pathfinding-time concern, not a bake-time one** — see the round-7 decision below.
 - Stairs stay crisp because riser faces exceed both the step tolerance and the slope limit, forcing clean boundary edges instead of the mushy registration a grid produces. Stairs use clipramps.
+
+> **DECISION (round 7): step tolerance is out of boundary classification**, for the same reason width is — it is agent-dependent, and baking it collapses information the pathfinder needs. A 2-stud step bakes as **wall from below** and **dropoff from above**; the pathfinder pairs the two at runtime per agent. Baked seams mean near-flush **continuity only** (`seamEps` 0.3): clipramp joins and small authored discrepancies between neighbouring floors. `stepUp = 2` survives only as the vertical **search window** for far-side probes, never as a classification threshold.
 
 ## Polygon optimization
 
