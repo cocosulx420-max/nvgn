@@ -118,7 +118,31 @@ Runs group by **(floor, blocker instance, plane)** — the plane itself, not a c
 
 > **STATUS: keep. Refine later, do not redesign.** This stage works and is validated; it is committed as the foundation the rest of the boundary work builds on. Returning to it means *refining* the remaining pieces listed below — not revisiting the raycast method itself, which is settled. Two categories are explicitly out of scope until the block-part pipeline is perfect, and are being deferred deliberately rather than forgotten: **Unions/MeshParts you stand *on*** (they get world-aligned `fallback` grids, which `sampleFrontier` skips, so a union floor currently produces zero boundary — note that unions you walk *into* already work, since the ray does not care what it hit), and **Terrain**, on the same footing. Get normal parts perfect first.
 
-**Still owed.** Dropoff and tier edges have no blocking face to steal, so they remain lattice polylines flagged `exact = false`: dropoffs want the same construction with `F` as its own blocker (its exact top-face rim), and `tier` — a node killed by overhead cover with nothing blocking at body height — is 6 studs of the entire test scene. Each ramp entry currently emits a **matched pair** (the ramp's seam and the adjacent floor's), correct as half-edges but needing dedup into one portal record at the weld stage. **Corner closure stays a separate pass** by design: missing corners were never caused by line derivation but by exposure trimming deleting the samples near a corner, so the fix is to intersect adjacent runs' *lines* — exact even where no sample survives — which should retire v1's weld / mergeCollinear / dangling-extension passes rather than tune them.
+#### Closure — vertices come from line intersections, never from samples
+
+Stage A originally emitted each run's extent straight from the sample mask, which is wrong by up to half a cell in **both** directions at once: it overshoots past a corner (the last sample's half-cell extension) and undershoots before one (exposure trimming removed the samples there). Those looked like three unrelated defects — edges crossing past each other, edges failing to meet, and stray fragments — but all three are the same error, and none of them is a *line* error: the lines are plane-derived and exact to 0.002 studs.
+
+So runs are **lines**; the mask only hints which portion is real. A floor's lines are intersected with each other, those intersections are the **only** legal vertices, and endpoints snap **along their own line** onto them. Overshoot trims back and undershoot extends forward — the same operation, landing on the identical point — so a corner closes because two edges share one *computed* vertex, not because two measured endpoints were welded together. Collinearity is likewise identity rather than tolerance: two runs share a line iff the same plane pair generated them.
+
+Consequences worth keeping straight:
+
+- **Every class is now a plane pair**, so there is one code path. `dropoff` uses the floor part's own rim plane (which also fixes the lattice under-covering a rim whenever a part isn't a whole number of cells); `tier` uses the overhang's leading edge. Dropoff is ~60% of all boundary length, so leaving it on the lattice would have walked the staircase back in through polygonization.
+- **Rim planes double as virtual lines.** Where two slabs abut flush, coverage correctly emits no boundary, so a wall crossing both floors has nothing to intersect at the junction. The rim plane exists geometrically regardless, and both slabs' rims coincide there.
+- **Snapping is asymmetric.** Trimming inward is free — the run really does end at the corner. Extending outward claims boundary where no sample was found, so it is capped at roughly the mask's own quantization (`maxExtend` 0.75). A generous outward reach lets an end jump to whatever vertex lies ahead, which produced 2-stud overshoots into open space.
+- **Except at strong vertices.** A vertex is *strong* when the other line's own extent already reaches it, rather than being extrapolated there too. Real corners earn `maxExtendStrong` (1.6); a ramp base needed 1.07. Weak vertices keep the tight cap.
+- **Near-coplanar faces are one wall.** Authored walls are built from several parts flush to a fraction of a stud but not equal, which yields parallel lines that can never intersect — no corner-closure can reach them. Faces within `coplanarEps` resolve to a single line, taking the offset furthest toward the walkable side (conservative: the agent is held a hair further from the wall).
+
+> **Trap, twice burned:** `cond and X or Y` silently yields `Y` whenever `X` is false. It shipped once in the trim/extend budget selection — handing outward moves the inward budget and quietly restoring the over-extension the cap existed to prevent — and once in an audit script, which then under-reported open endpoints and sent an investigation down the wrong path. Write branches explicitly in this file.
+
+#### Open endpoints are not all defects
+
+Three distinct outcomes, and conflating them buries the real ones:
+
+- **Handover** — walkable floor continues past the end onto a *different* part, whose own boundary picks the region up elsewhere. Normal; loop assembly stitches across it.
+- **Deferred bridge** — a rim gap that exists only because the neighbouring floor is a union/mesh (deferred, so it emits nothing). Both sides lie on the same rim line, so the bridge is exact, follows the part's own rim, and is marked `provisional`. It walls off an un-meshed surface, which is the conservative reading, and disappears once unions emit boundaries.
+- **Hole** — anything else. These are the only ones worth chasing.
+
+**Still owed.** Each ramp entry emits a **matched pair** (the ramp's seam and the adjacent floor's), correct as half-edges but needing dedup into one portal record at the weld stage. Two frontier samples on the test scene still produce no edge: a 7×1×7 slab resting **0.13 studs** above a tilted floor — an obstacle you walk around, not a crawl space — which every body-height ray misses *even unfiltered*, because near-flush geometry is what rays handle worst (the same family as the inside-origin trap). The fix is to fall back to the killer's own face planes, which are exact for a Block and only needed where rays have demonstrably failed. Everything else on the test scene closes: **0 holes**, 3 handovers, 1 provisional bridge.
 
 ### Slopes, steps, and stairs
 

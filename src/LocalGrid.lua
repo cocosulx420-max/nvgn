@@ -49,6 +49,12 @@ export type Grid = {
 	origin: Vector3?,         -- face corner (world); block grids only
 	u: Vector3?, v: Vector3?, -- in-plane unit axes (world); block grids only
 	n: Vector3?,              -- surface normal (world); block grids only
+	-- The walkable face's own rectangle, kept so the boundary stage can steal
+	-- the part's RIM planes exactly. Without it a dropoff can only be measured
+	-- from the cell mask, which quantizes to the lattice and stops up to a
+	-- stud short whenever the part size is not a whole number of cells.
+	center: Vector3?,         -- centre of the walkable face (world)
+	uExt: number?, vExt: number?, -- half-extents along u and v
 	step: number,
 	cells: {Cell},
 	index: { [string]: Cell },-- "ui:vi" -> cell
@@ -145,6 +151,7 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 		part = part, fallback = false, origin = corner,
 		u = u, v = v, n = n, step = c.step, cells = {}, index = {},
 		dead = {}, deadIndex = {},
+		center = surfaceCenter, uExt = uExt, vExt = vExt,
 	}
 
 	local function kill(iu: number, iv: number, pos: Vector3, killer: Instance?)
