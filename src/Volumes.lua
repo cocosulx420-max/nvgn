@@ -46,12 +46,19 @@ export type Volume = {
 	maxClearance: number,  -- spread within the band, for diagnostics
 	covers: {Instance},    -- what causes it; destroy these and the volume dies
 	cells: number,
+	-- Connected-component id: boxes of one continuous restricted space share
+	-- it. This is a SEMANTIC grouping, not a geometric merge — no box is
+	-- combined and no clearance precision is lost. It gives "this crawl
+	-- tunnel" a single handle for an NPC to reason about ("take the tunnel"),
+	-- and one id to invalidate when the part causing it is destroyed.
+	component: number,
 }
 export type Config = {
 	cap: number?,
 	band: number?,
 	expand: number?,
 	minCells: number?,
+	linkDy: number?,
 }
 
 local DEFAULT = {
@@ -68,14 +75,78 @@ local DEFAULT = {
 	-- Outward rounding, in the safe direction (see note 2 above). Half a cell
 	-- covers the lattice quantization exactly.
 	expand = 0.5,
+	-- MUST stay 1. Raising it drops small rectangles, and dropping coverage is
+	-- the UNSAFE direction — a hole means an agent walks upright into a low
+	-- pocket. To get fewer volumes, widen `band` instead (that stays
+	-- conservative). Enforced below rather than left as a footgun.
 	minCells = 1,
+	-- Two boxes join a component when their footprints touch and their bases
+	-- sit within this height of each other. Stops a tunnel from linking to an
+	-- unrelated restricted space on the floor above.
+	linkDy = 1.5,
 }
 
 local function merged(cfg): any
 	local c = {}
 	for k, v in pairs(DEFAULT) do c[k] = v end
 	if cfg then for k, v in pairs(cfg) do if v ~= nil then c[k] = v end end end
+	if c.minCells > 1 then
+		warn("[NVGN.Volumes] minCells > 1 would delete coverage (holes = an agent " ..
+			"walks upright into a low pocket). Clamped to 1; widen `band` instead.")
+		c.minCells = 1
+	end
 	return c
+end
+
+--------------------------------------------------------------------------
+-- Geometry helpers. Everything is a box standing on a floor, so overlap is
+-- tested as {rotated rectangle in XZ} x {height band}, not full 3D SAT: the
+-- vertical axis is always world-up here, which makes the separating-axis set
+-- just the four footprint edge normals.
+--------------------------------------------------------------------------
+
+local function footprintAxes(cf: CFrame)
+	local r, f = cf.RightVector, cf.LookVector
+	local a1 = Vector2.new(r.X, r.Z)
+	local a2 = Vector2.new(f.X, f.Z)
+	if a1.Magnitude < 1e-4 then a1 = Vector2.new(1, 0) else a1 = a1.Unit end
+	if a2.Magnitude < 1e-4 then a2 = Vector2.new(0, 1) else a2 = a2.Unit end
+	return a1, a2
+end
+
+local function corners2D(v: Volume): {Vector2}
+	local a1, a2 = footprintAxes(v.cframe)
+	local p = Vector2.new(v.cframe.Position.X, v.cframe.Position.Z)
+	local hx, hz = v.size.X * 0.5, v.size.Z * 0.5
+	return {
+		p + a1 * hx + a2 * hz, p + a1 * hx - a2 * hz,
+		p - a1 * hx - a2 * hz, p - a1 * hx + a2 * hz,
+	}
+end
+
+local function project(pts: {Vector2}, axis: Vector2): (number, number)
+	local mn, mx = math.huge, -math.huge
+	for _, p in ipairs(pts) do
+		local d = p:Dot(axis)
+		mn = math.min(mn, d); mx = math.max(mx, d)
+	end
+	return mn, mx
+end
+
+-- Convex overlap in the horizontal plane (separating-axis, both shapes' edge
+-- normals). `pad` lets a caller treat touching-but-not-overlapping as overlap.
+local function overlaps2D(a: {Vector2}, b: {Vector2}, axes: {Vector2}, pad: number): boolean
+	for _, ax in ipairs(axes) do
+		local amn, amx = project(a, ax)
+		local bmn, bmx = project(b, ax)
+		if amx + pad < bmn or bmx + pad < amn then return false end
+	end
+	return true
+end
+
+-- Height of the walkable surface a volume rests on.
+local function baseY(v: Volume): number
+	return v.cframe.Position.Y - v.size.Y * 0.5
 end
 
 --------------------------------------------------------------------------
@@ -192,10 +263,13 @@ function Volumes.fromLocal(data: any, cfg: Config?)
 					maxClearance = mx,
 					covers = covers,
 					cells = #r.members,
+					component = 0, -- assigned below
 				}
 			end
 		end
 	end
+
+	local nComponents = Volumes.assignComponents(out, c)
 
 	local tiers = { crawl = 0, crouch = 0, walk = 0 }
 	local cells = 0
@@ -208,10 +282,92 @@ function Volumes.fromLocal(data: any, cfg: Config?)
 	return {
 		volumes = out, config = c,
 		stats = {
-			volumes = #out, cells = cells, tiers = tiers,
+			volumes = #out, cells = cells, tiers = tiers, components = nComponents,
 			skippedFallback = skippedFallback, seconds = os.clock() - t0,
 		},
 	}
+end
+
+--------------------------------------------------------------------------
+-- Connected components: one continuous restricted space, one id.
+--
+-- Purely semantic — no box is merged and no clearance is lost. Candidate
+-- pairs come from the bucket index, so this is near-linear in practice rather
+-- than O(n^2): only volumes sharing a bucket are ever compared.
+--------------------------------------------------------------------------
+
+function Volumes.assignComponents(vols: {Volume}, cfg: Config?): number
+	local c = merged(cfg)
+	local parent: {number} = {}
+	for i = 1, #vols do parent[i] = i end
+
+	local function find(i: number): number
+		while parent[i] ~= i do
+			parent[i] = parent[parent[i]] -- path halving
+			i = parent[i]
+		end
+		return i
+	end
+	local function union(a: number, b: number)
+		local ra, rb = find(a), find(b)
+		if ra ~= rb then parent[rb] = ra end
+	end
+
+	-- bucket volumes by footprint so only plausible pairs are compared
+	local size = 8
+	local buckets: { [string]: {number} } = {}
+	local cache: { {Vector2} } = {}
+	for i, v in ipairs(vols) do
+		cache[i] = corners2D(v)
+		local mnx, mxx = math.huge, -math.huge
+		local mnz, mxz = math.huge, -math.huge
+		for _, p in ipairs(cache[i]) do
+			mnx = math.min(mnx, p.X); mxx = math.max(mxx, p.X)
+			mnz = math.min(mnz, p.Y); mxz = math.max(mxz, p.Y)
+		end
+		for bx = math.floor(mnx / size), math.floor(mxx / size) do
+			for bz = math.floor(mnz / size), math.floor(mxz / size) do
+				local k = string.format("%d:%d", bx, bz)
+				local b = buckets[k]
+				if not b then b = {}; buckets[k] = b end
+				b[#b + 1] = i
+			end
+		end
+	end
+
+	for _, b in pairs(buckets) do
+		for x = 1, #b - 1 do
+			for y = x + 1, #b do
+				local i, j = b[x], b[y]
+				if find(i) ~= find(j) then
+					local vi, vj = vols[i], vols[j]
+					if math.abs(baseY(vi) - baseY(vj)) <= c.linkDy then
+						local a1, a2 = footprintAxes(vi.cframe)
+						local b1, b2 = footprintAxes(vj.cframe)
+						local axes = {
+							Vector2.new(-a1.Y, a1.X), Vector2.new(-a2.Y, a2.X),
+							Vector2.new(-b1.Y, b1.X), Vector2.new(-b2.Y, b2.X),
+						}
+						-- volumes already overlap by `expand` on each side where
+						-- they abut; a small pad also links exactly-touching ones
+						if overlaps2D(cache[i], cache[j], axes, 0.05) then
+							union(i, j)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	local ids: { [number]: number } = {}
+	local n = 0
+	for i, v in ipairs(vols) do
+		local r = find(i)
+		local id = ids[r]
+		if not id then n += 1; id = n; ids[r] = id end
+		v.component = id
+	end
+	return n
 end
 
 function Volumes.build(cfg: Config?)
@@ -276,6 +432,84 @@ function Volumes.fits(idx: Index, pos: Vector3, standingHeight: number): boolean
 end
 
 --------------------------------------------------------------------------
+-- Per-polygon annotation.
+--
+-- Polygons are generated in ABSTRACTION of these volumes — headroom never
+-- splits the mesh. But a polygon can then be partly covered by a volume, and
+-- poly-level A* cannot express "passable, but not through the middle". So
+-- each poly carries ONE scalar: the lowest clearance any volume imposes
+-- anywhere over its area.
+--
+-- It is a conservative PRE-FILTER, not a replacement for the volumes:
+--
+--   polyMinClearance >= agentStanding  -> the whole poly fits; skip volume
+--                                         checks entirely (the common ~5-stud
+--                                         human case, so the hot path is free)
+--   otherwise                          -> consult the volumes along the
+--                                         smoothed corridor for per-segment
+--                                         crouch/crawl modes, or to reject
+--                                         the poly for an agent that cannot
+--                                         fit at all
+--
+-- Returns math.huge where nothing restricts the polygon.
+--------------------------------------------------------------------------
+
+function Volumes.minClearanceOverPoly(idx: Index, verts: {Vector3}, cfg: Config?): number
+	if #verts == 0 then return math.huge end
+	local c = merged(cfg)
+
+	local poly2: {Vector2} = {}
+	local mnx, mxx, mnz, mxz = math.huge, -math.huge, math.huge, -math.huge
+	local sumY = 0
+	for _, p in ipairs(verts) do
+		poly2[#poly2 + 1] = Vector2.new(p.X, p.Z)
+		mnx = math.min(mnx, p.X); mxx = math.max(mxx, p.X)
+		mnz = math.min(mnz, p.Z); mxz = math.max(mxz, p.Z)
+		sumY += p.Y
+	end
+	local polyY = sumY / #verts
+
+	-- polygon edge normals, for the separating-axis test
+	local axes: {Vector2} = {}
+	for i = 1, #poly2 do
+		local a = poly2[i]
+		local b = poly2[(i % #poly2) + 1]
+		local e = b - a
+		if e.Magnitude > 1e-4 then
+			e = e.Unit
+			axes[#axes + 1] = Vector2.new(-e.Y, e.X)
+		end
+	end
+
+	local best = math.huge
+	local seen: { [any]: boolean } = {}
+	for bx = math.floor(mnx / idx.cell), math.floor(mxx / idx.cell) do
+		for bz = math.floor(mnz / idx.cell), math.floor(mxz / idx.cell) do
+			local b = idx.buckets[string.format("%d:%d", bx, bz)]
+			if b then
+				for _, v in ipairs(b) do
+					if not seen[v] and v.minClearance < best then
+						seen[v] = true
+						-- same storey only: a low ceiling one floor up is not
+						-- this polygon's problem
+						if math.abs(baseY(v) - polyY) <= c.linkDy then
+							local a1, a2 = footprintAxes(v.cframe)
+							local all = table.clone(axes)
+							all[#all + 1] = Vector2.new(-a1.Y, a1.X)
+							all[#all + 1] = Vector2.new(-a2.Y, a2.X)
+							if overlaps2D(poly2, corners2D(v), all, 0) then
+								best = v.minClearance
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+--------------------------------------------------------------------------
 
 -- Debug only. CanQuery/CanCollide off and parented under NVGN_Debug, so a
 -- later bake cannot see these: volumes are data, not world objects.
@@ -301,7 +535,9 @@ function Volumes.visualize(result: any, parent: Instance?)
 		else
 			p.Color = Color3.new(0.5, 0.75, 1)      -- restricted, still walkable
 		end
-		p.Name = string.format("clr%.2f", v.minClearance)
+		-- name carries both numbers, so a click in the explorer answers "how low"
+		-- and "which tunnel" at once
+		p.Name = string.format("clr%.2f#%d", v.minClearance, v.component)
 		p.Parent = folder
 	end
 	return folder
