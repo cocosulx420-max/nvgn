@@ -25,6 +25,22 @@ export type Cell = {
 	normal: Vector3,
 	slope: number,            -- degrees from world-up
 	clearance: number,        -- studs of vertical headroom (capped)
+	-- What is overhead, when anything is. Free here (the clearance probe
+	-- already found it) and it is the attribution clearance volumes need:
+	-- destroy the cover, delete the volume, instead of re-polygonizing.
+	cover: Instance?,
+}
+
+-- A sample that would have been floor but was killed, kept WITH the instance
+-- that killed it. Attribution is captured at kill time from the probe that
+-- found it, so the boundary stage never re-probes the world to ask "why is
+-- there nothing here?" — no second chance to hit the inside-origin trap, and
+-- no misattribution. Dead cells are a selection mask and nothing else: they
+-- are never used as geometry.
+export type DeadCell = {
+	ui: number, vi: number,
+	pos: Vector3,
+	killer: Instance?,
 }
 
 export type Grid = {
@@ -36,6 +52,8 @@ export type Grid = {
 	step: number,
 	cells: {Cell},
 	index: { [string]: Cell },-- "ui:vi" -> cell
+	dead: {DeadCell},
+	deadIndex: { [string]: DeadCell },
 }
 
 export type Config = {
@@ -126,7 +144,14 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 	local grid: Grid = {
 		part = part, fallback = false, origin = corner,
 		u = u, v = v, n = n, step = c.step, cells = {}, index = {},
+		dead = {}, deadIndex = {},
 	}
+
+	local function kill(iu: number, iv: number, pos: Vector3, killer: Instance?)
+		local d: DeadCell = { ui = iu, vi = iv, pos = pos, killer = killer }
+		grid.dead[#grid.dead + 1] = d
+		grid.deadIndex[string.format("%d:%d", iu, iv)] = d
+	end
 
 	local step = c.step
 	local nu = math.max(1, math.floor(2 * uExt / step + 1e-6))
@@ -149,26 +174,37 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 			-- never sit above its own top face. Only a clear probe guarantees the
 			-- up-ray origin is outside every collider, making its distance exact.
 			probe.CFrame = CFrame.new(res.Position + UP * (0.1 + (c.minClearance - 0.1) * 0.5))
-			local blocked = false
+			local killer: Instance? = nil
 			for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
-				if hit ~= part then blocked = true; break end
+				if hit ~= part then killer = hit; break end
 			end
-			if blocked then continue end
+			if killer then
+				kill(iu, iv, res.Position, killer)
+				continue
+			end
 			local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
 			local clearance = upRes and upRes.Distance or c.clearCap
+			local cover: Instance? = upRes and upRes.Instance or nil
 			-- Terrain is not in `parts` (never walkable) but still blocks headroom;
 			-- overlap queries are parts-only, so probe it with a terrain-only ray
 			-- pair (down-ray catches the embedded-origin case for blobs on floors).
 			local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, rpTerrain)
 			if tUp then
-				clearance = math.min(clearance, tUp.Distance)
+				if tUp.Distance < clearance then
+					clearance = tUp.Distance
+					cover = workspace.Terrain
+				end
 			elseif workspace:Raycast(res.Position + UP * c.clearCap, -UP * (c.clearCap - 0.25), rpTerrain) then
 				clearance = 0
+				cover = workspace.Terrain
 			end
-			if clearance < c.minClearance then continue end
+			if clearance < c.minClearance then
+				kill(iu, iv, res.Position, cover)
+				continue
+			end
 			local cell: Cell = {
 				ui = iu, vi = iv, pos = res.Position, normal = res.Normal,
-				slope = slope, clearance = clearance,
+				slope = slope, clearance = clearance, cover = cover,
 			}
 			grid.cells[#grid.cells + 1] = cell
 			grid.index[string.format("%d:%d", iu, iv)] = cell
@@ -181,6 +217,7 @@ end
 local function buildFallbackGrid(part: BasePart, surfels: {any}, c: any): Grid
 	local grid: Grid = {
 		part = part, fallback = true, step = c.step, cells = {}, index = {},
+		dead = {}, deadIndex = {},
 	}
 	for _, s in ipairs(surfels) do
 		if s.clearance < c.minClearance then continue end
@@ -188,7 +225,7 @@ local function buildFallbackGrid(part: BasePart, surfels: {any}, c: any): Grid
 		local iv = math.floor(s.pos.Z / c.step)
 		local cell: Cell = {
 			ui = iu, vi = iv, pos = s.pos, normal = s.normal,
-			slope = s.slope, clearance = s.clearance,
+			slope = s.slope, clearance = s.clearance, cover = s.cover,
 		}
 		grid.cells[#grid.cells + 1] = cell
 		grid.index[string.format("%d:%d", iu, iv)] = cell
@@ -220,7 +257,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 
 	local byPart = groupByPart(floorData.surfels)
 	local grids: { [BasePart]: Grid } = {}
-	local nBlock, nFallback, nCells = 0, 0, 0
+	local nBlock, nFallback, nCells, nDead = 0, 0, 0, 0
 	for part, sfs in pairs(byPart) do
 		local g: Grid
 		if isBlock(part) then
@@ -232,12 +269,13 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 		end
 		grids[part] = g
 		nCells += #g.cells
+		nDead += #g.dead
 	end
 	probe:Destroy()
 
 	return {
 		grids = grids, config = c,
-		stats = { parts = nBlock + nFallback, block = nBlock, fallback = nFallback, cells = nCells },
+		stats = { parts = nBlock + nFallback, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead },
 	}
 end
 
