@@ -275,6 +275,20 @@ Test scene: 19 of 160 polygons restricted, covering 12.9% of walkable area, lowe
 
 **Known conservatism, unchanged by this.** The scalar is a **pre-filter**, not the whole answer. A polygon only partly covered by a low volume is no longer atomic, so a tall agent is excluded from all 1012 studs² even where the low patch is a corner of it. Hard exclusion uses the scalar; mode selection (walk/crouch/crawl cost) works off the smoothed corridor and the volume index directly, which is why the index must be searched during A\* rather than consulted on contact.
 
+### Serialization — `src/Serialize.lua`
+
+Line-based versioned text, one record per line, stored as a `StringValue` (`ServerStorage.NVGN_Bake`). Not JSON — the encoder would be simpler but every number would carry punctuation, and a text bake is meant to be diffable so an unexpected change shows what changed. Not binary — the map is tens of kilobytes and legibility is worth more than the last factor of two.
+
+**Coordinates are not quantized.** Every stage exists to keep boundary geometry exact (lines accurate to 0.002 studs), so rounding on the way out would discard that at the final step for a saving that does not matter. `%.9g` round-trips float32 exactly. Verified: worst vertex deviation across 646 vertices is **0.000000000 studs**.
+
+**Part references** are the hard part — a polygon knows its `BasePart`, destruction needs that attribution to survive a reload, and an instance cannot go into a string. Two mechanisms: an `NVGN_Id` **attribute** written onto each referenced part at save time (robust against renaming, and against a rename containing a dot, which breaks path parsing), with the full name stored alongside as a diagnostic fallback. Attributes are not instances, so unlike a marker part they cannot be picked up by the next bake — a trap this project has fallen into twice.
+
+**A part that resolves to nothing is not an error.** That is what a destroyed building looks like. The polygon is kept, `floor` is nil, `floorName` survives for diagnosis, and the load still reports `ok` — geometry is unaffected by attribution going missing. Verified by hiding a part's id: 1 unresolved, 1 orphaned polygon, mesh still valid.
+
+Test scene: 58.5 KB, encode 0.003s, decode 0.002s, all counts and area match, and the portal graph rebuilt from the bake alone reproduces the live build exactly (6 components, largest 69, 44 isolated). Neighbour lists are derived on load rather than stored.
+
+**Not yet in the bake:** the SVO, which must persist to runtime because width is resolved there against solid queries.
+
 ## Agents & sizing
 
 Two dimensions decide whether an agent fits: **clearance** (vertical) and **width** (`2 × radius`, horizontal). Only **clearance** is baked — a per-surfel/per-polygon annotation, because vertical headroom can't be recovered from the 2D geometry. **Width is never baked and is not a generation concern at all.** It is resolved entirely at **pathfinding time**, by the pathfinder, using the navmesh (portal shared-edge length, a poly's opposing boundary edges) together with **SVO** solid queries. The generator emits nothing width-related — no field, no annotation, no split.
