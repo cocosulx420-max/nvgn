@@ -1,34 +1,43 @@
 --!strict
--- NVGN.Polys — convex decomposition of the assembled regions.
+-- NVGN.Polys — regions into navmesh polygons.
 --
--- The target shape of the output is a design requirement, not an afterthought:
--- big open ground should be a FEW LARGE polygons, detail should appear only
--- where the geometry actually demands it, and long thin slivers are unwanted
--- everywhere. That rules out the textbook route. Ear clipping followed by
--- Hertel–Mehlhorn merges diagonals in whatever order the vertices happen to sit
--- in, which gives a uniform drizzle of similar polygons and keeps whichever
--- slivers the triangulator produced.
+-- SHAPE IS THE REQUIREMENT. Open ground must come out as a few huge rectangles;
+-- everything else must be ordinary small polygons. Long stretched pieces are
+-- unacceptable anywhere, whether or not they are convex and whether or not they
+-- tile correctly.
 --
--- So the merge is QUALITY-ORDERED. Every pair of adjacent polygons whose union
--- is convex is a candidate; the candidate whose union is FATTEST wins, and the
--- process repeats until no convex merge remains. Fatness is the isoperimetric
--- ratio 4*pi*area / perimeter^2 — 1 for a circle, ~0.79 for a square, and
--- falling toward 0 as a shape stretches. Ordering by it means a big open floor
--- collapses into one or two broad polygons, while a stair tread or a ledge keeps
--- the pieces its shape requires.
+-- Two general-purpose convex decompositions were built and measured first, and
+-- both failed that requirement for the same underlying reason:
 --
--- Two honest limits:
+--   * ear clipping + fatness-ordered merging — the merge is blocked by
+--     convexity, so strips around an obstacle stay strips (48 polygons on the
+--     200x200 floor, 4166 studs of cuts longer than 20).
+--   * trapezoidal sweep — worse on every axis (66 polygons, 6722 studs of long
+--     cuts, 39 slivers), because a vertical cut spans the whole slab: "short in
+--     x" is not short.
 --
---   * A genuinely thin region yields a thin polygon. A 0.45-stud strip between a
---     seam and a rim has no fat decomposition, and inventing one would mean
---     covering ground that is not walkable. Those are measured and reported
---     rather than hidden.
---   * Greedy is not optimal. Optimal convex partition is far more expensive and
---     buys little here, since the acceptance test is exact convexity either way.
+-- Neither is wrong as a decomposition. They are wrong as an ANSWER, because
+-- both treat all ground alike, and the interesting property here is that most
+-- ground is empty. So build the shape that is wanted directly.
+--
+-- PHASE 1 — MAXIMAL RECTANGLES. Take every vertex x and every vertex y in the
+-- floor's own frame as lattice lines. That lattice is EXACT — its coordinates
+-- are the geometry's own, so nothing is quantized and no staircase can appear —
+-- and it is sparse, a few dozen lines rather than one per stud. Cells wholly
+-- inside the region are then consumed repeatedly by the largest-area rectangle
+-- available. Open floor collapses into a handful of huge rectangles, and near
+-- obstacles the rectangles shrink by themselves, because that is where the
+-- lattice is dense.
+--
+-- PHASE 2 — THE FRINGE. Only cells that a boundary edge actually crosses need
+-- anything cleverer, and those are small by construction, bounded by adjacent
+-- vertex coordinates. Their pieces are therefore small: the diagonal fringe of a
+-- rotated part, never a 200-stud needle. Each such cell is subdivided locally
+-- and the pieces inside the region are kept, ear-clipped if not already convex.
 --
 -- Class carrying: every polygon edge remembers whether it came from a wall,
--- seam, dropoff, tier or continuation, or whether it is an internal diagonal
--- this module introduced. Portal derivation later reads exactly that.
+-- seam, dropoff, tier or continuation, or whether it is an internal cut. Portal
+-- derivation later reads exactly that.
 
 local Loops = require(script.Parent:WaitForChild("Loops"))
 
@@ -37,28 +46,26 @@ local Polys = {}
 export type Poly = {
 	floor: BasePart,
 	verts: {Vector3},
-	classes: {string},    -- class of edge i -> i+1; "internal" = a diagonal
+	classes: {string},    -- class of edge i -> i+1; "internal" = a cut
 	area: number,
 	fatness: number,
+	rect: boolean,        -- came out of the rectangle phase
 }
 export type Config = {
-	convexEps: number?, collinearEps: number?, minFatness: number?,
+	weldEps: number?, convexEps: number?, minFatness: number?,
+	degenerateArea: number?, onEdgeEps: number?,
 }
 
 local DEFAULT = {
-	-- A reflex corner shallower than this is treated as flat. Boundary lines
-	-- arrive exact, so this only absorbs float noise from the projection.
+	-- Must match what Loops built its rings with: the fringe phase borrows its
+	-- subdivision, and a different weld would close faces differently.
+	weldEps = 0.02,
 	convexEps = 1e-4,
-	-- Merging often leaves a vertex sitting mid-edge; drop it when the turn is
-	-- this small AND the two edges carry the same class, so class boundaries are
-	-- never silently erased.
-	collinearEps = 1e-3,
-	-- Below this, a polygon is reported as a sliver. Reporting only: dropping
-	-- them would punch holes in the mesh.
+	-- Reporting threshold only. Dropping thin polygons would punch holes.
 	minFatness = 0.15,
-	-- Below this a polygon is a triangulation artifact along a bridge corridor,
-	-- not walkable ground.
 	degenerateArea = 1e-3,
+	-- How close a cut must lie to a boundary edge to inherit its class.
+	onEdgeEps = 0.02,
 }
 
 local function merged(cfg): any
@@ -69,6 +76,7 @@ local function merged(cfg): any
 end
 
 type V2 = { x: number, y: number }
+type Ring = { pts: {V2}, cls: {string} }
 
 local function cross2(ax: number, ay: number, bx: number, by: number): number
 	return ax * by - ay * bx
@@ -99,11 +107,7 @@ local function fatnessOf(pts: {V2}): number
 	return 4 * math.pi * math.abs(areaOf(pts)) / (p * p)
 end
 
--- Forward declaration: hole bridging needs the containment test, which is
--- defined with the ear-clipping helpers below.
-local pointInTri: (V2, V2, V2, V2) -> boolean
-
-local function pointInPoly2(pts: {V2}, x: number, y: number): boolean
+local function pointInPoly(pts: {V2}, x: number, y: number): boolean
 	local inside = false
 	local j = #pts
 	for i = 1, #pts do
@@ -117,201 +121,32 @@ local function pointInPoly2(pts: {V2}, x: number, y: number): boolean
 	return inside
 end
 
---------------------------------------------------------------------------
--- Hole bridging: splice each inner ring into the outer one along a diagonal,
--- turning a polygon with holes into one simple polygon.
---
--- Standard construction: take the hole's rightmost vertex, shoot +x at the outer
--- ring, and bridge to the endpoint of the edge hit (the vertex of that edge with
--- the larger x, which is visible from the hole by construction). Holes here are
--- obstacle footprints well inside their floor, so the degenerate cases that make
--- this fiddly in general do not arise.
---------------------------------------------------------------------------
-
-type Ring = { pts: {V2}, cls: {string} }
-
-local function bridgeHoles(outer: Ring, holes: {Ring}): Ring
-	local ring = { pts = table.clone(outer.pts), cls = table.clone(outer.cls) }
-	-- innermost first, so a bridge never has to cross an earlier bridge
-	local order = {}
-	for i = 1, #holes do order[i] = i end
-	table.sort(order, function(a, b)
-		local ax, bx = -math.huge, -math.huge
-		for _, p in ipairs(holes[a].pts) do ax = math.max(ax, p.x) end
-		for _, p in ipairs(holes[b].pts) do bx = math.max(bx, p.x) end
-		return ax > bx
-	end)
-
-	local doneHole: { [number]: boolean } = {}
-	for _, hi in ipairs(order) do
-		local h = holes[hi]
-		doneHole[hi] = true
-		local mi, mx = 1, -math.huge
-		for i, p in ipairs(h.pts) do
-			if p.x > mx then mx, mi = p.x, i end
-		end
-		local M = h.pts[mi]
-
-		-- BRIDGE TARGET, CHOSEN BY VERIFICATION RATHER THAN BY RULE.
-		--
-		-- Two textbook rules were tried here and both picked blocked targets on
-		-- the 200x200 floor. The +x ray with a reflex-vertex refinement misses
-		-- the zero-width corridors left by earlier bridges, whose corners are
-		-- collinear rather than reflex; nearest-visible-vertex instead pinches
-		-- against holes already spliced in. Either way the ring self-intersects,
-		-- ear clipping stalls, and the region loses its area silently.
-		--
-		-- So do not predict which bridge is legal — splice it and CHECK. The
-		-- resulting ring must be simple, which is cheap to verify at these sizes
-		-- (n <= 90) and admits no false positives. Candidates are tried nearest
-		-- first, so the accepted bridge is still the short, sensible one.
-		local function properCross(p1: V2, p2: V2, p3: V2, p4: V2): boolean
-			local d1 = cross2(p2.x - p1.x, p2.y - p1.y, p3.x - p1.x, p3.y - p1.y)
-			local d2 = cross2(p2.x - p1.x, p2.y - p1.y, p4.x - p1.x, p4.y - p1.y)
-			local d3 = cross2(p4.x - p3.x, p4.y - p3.y, p1.x - p3.x, p1.y - p3.y)
-			local d4 = cross2(p4.x - p3.x, p4.y - p3.y, p2.x - p3.x, p2.y - p3.y)
-			return ((d1 > 1e-9 and d2 < -1e-9) or (d1 < -1e-9 and d2 > 1e-9))
-				and ((d3 > 1e-9 and d4 < -1e-9) or (d3 < -1e-9 and d4 > 1e-9))
-		end
-		local function isSimple(pts: {V2}): boolean
-			local n = #pts
-			for i = 1, n do
-				local i2 = (i % n) + 1
-				for j = i + 1, n do
-					local j2 = (j % n) + 1
-					if i ~= j and i ~= j2 and i2 ~= j then
-						if properCross(pts[i], pts[i2], pts[j], pts[j2]) then return false end
-					end
-				end
+-- Clip a segment to a rectangle (Liang-Barsky). Returns nil when it misses.
+-- Used for both "does this edge cross the cell" and "what does the cell see",
+-- so the two can never disagree.
+local function clipSeg(a: V2, b: V2, x0: number, y0: number, x1: number, y1: number): (V2?, V2?)
+	local dx, dy = b.x - a.x, b.y - a.y
+	local t0, t1 = 0, 1
+	local ps = { -dx, dx, -dy, dy }
+	local qs = { a.x - x0, x1 - a.x, a.y - y0, y1 - a.y }
+	for i = 1, 4 do
+		local pp, qq = ps[i], qs[i]
+		if math.abs(pp) < 1e-12 then
+			if qq < 0 then return nil, nil end
+		else
+			local t = qq / pp
+			if pp < 0 then
+				if t > t1 then return nil, nil end
+				if t > t0 then t0 = t end
+			else
+				if t < t0 then return nil, nil end
+				if t < t1 then t1 = t end
 			end
-			return true
 		end
-
-		local function spliceAt(B: number): Ring
-			local np, nc = {}, {}
-			for i = 1, B do
-				np[#np + 1] = ring.pts[i]
-				nc[#nc + 1] = ring.cls[i]
-			end
-			nc[#nc] = "internal" -- ring[B] -> hole bridge
-			for k = 0, #h.pts - 1 do
-				local idx = ((mi - 1 + k) % #h.pts) + 1
-				np[#np + 1] = h.pts[idx]
-				nc[#nc + 1] = h.cls[idx]
-			end
-			np[#np + 1] = h.pts[mi]
-			nc[#nc + 1] = "internal" -- hole -> ring bridge back
-			for i = B, #ring.pts do
-				np[#np + 1] = ring.pts[i]
-				nc[#nc + 1] = ring.cls[i]
-			end
-			return { pts = np, cls = nc }
-		end
-
-		local cand = {}
-		for i = 1, #ring.pts do
-			local dx, dy = ring.pts[i].x - M.x, ring.pts[i].y - M.y
-			cand[#cand + 1] = { i = i, d = dx * dx + dy * dy }
-		end
-		table.sort(cand, function(a, b) return a.d < b.d end)
-
-		local accepted = nil
-		for _, cd in ipairs(cand) do
-			local trial = spliceAt(cd.i)
-			if isSimple(trial.pts) then accepted = trial; break end
-		end
-		ring = accepted or spliceAt(cand[1].i)
 	end
-	return ring
+	if t1 - t0 < 1e-9 then return nil, nil end
+	return { x = a.x + dx * t0, y = a.y + dy * t0 }, { x = a.x + dx * t1, y = a.y + dy * t1 }
 end
-
---------------------------------------------------------------------------
--- Ear clipping, picking the BEST ear rather than the first.
---
--- The choice matters because it sets the floor on quality: first-ear clipping
--- reliably shaves needle triangles off convex stretches, and while the merge
--- pass can rebuild fat polygons from needles, it cannot always do so without
--- leaving one behind. Scoring ears by their smallest angle costs one pass and
--- starts the merge from a much better place.
---------------------------------------------------------------------------
-
-local function minAngle(a: V2, b: V2, c: V2): number
-	local function ang(p: V2, q: V2, r: V2): number
-		local ux, uy = p.x - q.x, p.y - q.y
-		local vx, vy = r.x - q.x, r.y - q.y
-		local lu = math.sqrt(ux * ux + uy * uy)
-		local lv = math.sqrt(vx * vx + vy * vy)
-		if lu < 1e-12 or lv < 1e-12 then return 0 end
-		return math.acos(math.clamp((ux * vx + uy * vy) / (lu * lv), -1, 1))
-	end
-	return math.min(ang(c, a, b), math.min(ang(a, b, c), ang(b, c, a)))
-end
-
--- STRICTLY inside — a point merely ON the triangle's boundary does not block the
--- ear. This is not a nicety: rim lines get split wherever a boundary edge meets
--- them, so rings are full of vertices lying exactly on a longer straight run. An
--- inclusive test treats every one of those as blocking, no ear is ever found,
--- and triangulation bails after one triangle. That silently lost 49% of the map
--- area, most of it the 200x200 floor.
-function pointInTri(p: V2, a: V2, b: V2, c: V2): boolean
-	local eps = 1e-9
-	local d1 = cross2(b.x - a.x, b.y - a.y, p.x - a.x, p.y - a.y)
-	local d2 = cross2(c.x - b.x, c.y - b.y, p.x - b.x, p.y - b.y)
-	local d3 = cross2(a.x - c.x, a.y - c.y, p.x - c.x, p.y - c.y)
-	return (d1 > eps and d2 > eps and d3 > eps)
-		or (d1 < -eps and d2 < -eps and d3 < -eps)
-end
-
--- Returns triangles as triples of indices into `ring.pts`.
-local function earClip(ring: Ring, c: any): {{number}}
-	local n = #ring.pts
-	local idx = {}
-	for i = 1, n do idx[i] = i end
-	if areaOf(ring.pts) < 0 then
-		local r = {}
-		for i = n, 1, -1 do r[#r + 1] = idx[i] end
-		idx = r
-	end
-
-	local tris: {{number}} = {}
-	local guard = 0
-	while #idx > 3 and guard < 100000 do
-		guard += 1
-		local bestK, bestScore = nil, -1
-		for k = 1, #idx do
-			local i0 = idx[((k - 2) % #idx) + 1]
-			local i1 = idx[k]
-			local i2 = idx[(k % #idx) + 1]
-			local a, b, cc = ring.pts[i0], ring.pts[i1], ring.pts[i2]
-			-- convex corner?
-			if cross2(b.x - a.x, b.y - a.y, cc.x - b.x, cc.y - b.y) > c.convexEps then
-				local ok = true
-				for _, j in ipairs(idx) do
-					if j ~= i0 and j ~= i1 and j ~= i2 then
-						if pointInTri(ring.pts[j], a, b, cc) then ok = false; break end
-					end
-				end
-				if ok then
-					local s = minAngle(a, b, cc)
-					if s > bestScore then bestScore, bestK = s, k end
-				end
-			end
-		end
-		if not bestK then break end -- degenerate remainder; keep what we have
-		local k = bestK :: number
-		local i0 = idx[((k - 2) % #idx) + 1]
-		local i1 = idx[k]
-		local i2 = idx[(k % #idx) + 1]
-		tris[#tris + 1] = { i0, i1, i2 }
-		table.remove(idx, k)
-	end
-	if #idx == 3 then tris[#tris + 1] = { idx[1], idx[2], idx[3] } end
-	return tris
-end
-
---------------------------------------------------------------------------
--- Quality-ordered convex merging
---------------------------------------------------------------------------
 
 local function isConvex(pts: {V2}, c: any): boolean
 	local n = #pts
@@ -327,18 +162,108 @@ local function isConvex(pts: {V2}, c: any): boolean
 	return true
 end
 
--- Merge two adjacent cycles across EVERY edge they share, not just one.
+-- Strictly inside: a point ON the boundary must not block an ear. Rings carry
+-- vertices lying exactly on straight runs, because rim lines are split wherever
+-- a boundary edge meets them, and an inclusive test then finds no ear at all.
+local function pointInTri(p: V2, a: V2, b: V2, cc: V2): boolean
+	local eps = 1e-9
+	local d1 = cross2(b.x - a.x, b.y - a.y, p.x - a.x, p.y - a.y)
+	local d2 = cross2(cc.x - b.x, cc.y - b.y, p.x - b.x, p.y - b.y)
+	local d3 = cross2(a.x - cc.x, a.y - cc.y, p.x - cc.x, p.y - cc.y)
+	return (d1 > eps and d2 > eps and d3 > eps) or (d1 < -eps and d2 < -eps and d3 < -eps)
+end
+
+local function earClip(pts: {V2}, c: any): {{V2}}
+	local idx = {}
+	for i = 1, #pts do idx[i] = i end
+	if areaOf(pts) < 0 then
+		local r = {}
+		for i = #idx, 1, -1 do r[#r + 1] = idx[i] end
+		idx = r
+	end
+	local out: {{V2}} = {}
+	local guard = 0
+	while #idx > 3 and guard < 10000 do
+		guard += 1
+		local bestK, bestScore = nil, -1
+		for k = 1, #idx do
+			local a = pts[idx[((k - 2) % #idx) + 1]]
+			local b = pts[idx[k]]
+			local d = pts[idx[(k % #idx) + 1]]
+			if cross2(b.x - a.x, b.y - a.y, d.x - b.x, d.y - b.y) > c.convexEps then
+				local ok = true
+				for _, j in ipairs(idx) do
+					local q = pts[j]
+					if q ~= a and q ~= b and q ~= d and pointInTri(q, a, b, d) then ok = false; break end
+				end
+				if ok then
+					-- prefer the ear whose shortest side is longest, which keeps
+					-- fringe pieces compact rather than needle-like
+					local s = math.min(
+						(b.x - a.x) ^ 2 + (b.y - a.y) ^ 2,
+						math.min((d.x - b.x) ^ 2 + (d.y - b.y) ^ 2,
+							(a.x - d.x) ^ 2 + (a.y - d.y) ^ 2))
+					if s > bestScore then bestScore, bestK = s, k end
+				end
+			end
+		end
+		if not bestK then break end
+		local k = bestK :: number
+		out[#out + 1] = {
+			pts[idx[((k - 2) % #idx) + 1]], pts[idx[k]], pts[idx[(k % #idx) + 1]],
+		}
+		table.remove(idx, k)
+	end
+	if #idx == 3 then
+		out[#out + 1] = { pts[idx[1]], pts[idx[2]], pts[idx[3]] }
+	end
+	return out
+end
+
+--------------------------------------------------------------------------
+-- Largest-area rectangle over a boolean cell grid.
 --
--- Rather than reason about where a shared chain starts and ends, drop the shared
--- edges and re-chain what remains. If the leftovers form exactly one closed
--- cycle the merge is valid; anything else — a non-contiguous chain, which would
--- pinch or disconnect the union — fails the walk and is rejected.
+-- The usual maximal-rectangle histogram scan, but weighted by real coordinates
+-- rather than by cell counts: this lattice is irregular, so twelve narrow cells
+-- can be worth less than one wide one.
+--------------------------------------------------------------------------
+
+local function largestRect(free: {{boolean}}, w: {number}, h: {number}): any
+	local nx, ny = #w, #h
+	local best = { area = 0 }
+	local heights = {}
+	for i = 1, nx do heights[i] = 0 end
+	for j = 1, ny do
+		for i = 1, nx do
+			if free[i][j] then heights[i] += h[j] else heights[i] = 0 end
+		end
+		for i = 1, nx do
+			if heights[i] > 0 then
+				local minH = heights[i]
+				local wsum = 0
+				for k = i, nx do
+					if heights[k] <= 0 then break end
+					minH = math.min(minH, heights[k])
+					wsum += w[k]
+					local a = minH * wsum
+					if a > best.area then
+						best = { area = a, i0 = i, i1 = k, jTop = j, height = minH }
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- Merge two adjacent cycles across EVERY edge they share.
 --
+-- Drop the shared edges and re-chain the leftovers; exactly one closed cycle
+-- means the merge is valid, anything else would pinch or disconnect the union.
 -- An edge counts as shared only when THIS cycle has (u,v) and the OTHER has
--- (v,u). Testing both directions against one combined set instead marks a
--- polygon's own edges as shared and discards everything, quietly turning the
--- whole merge pass into a no-op.
-local function mergeCycles(p: {number}, q: {number}): {number}?
+-- (v,u) — testing both directions against one set marks a polygon's own edges
+-- as shared and discards everything.
+local function mergeCycles(p: {number}, q: {number}, edgeClass): {number}?
 	local pEdge: { [string]: boolean } = {}
 	for i = 1, #p do pEdge[p[i] .. ">" .. p[(i % #p) + 1]] = true end
 	local drop: { [string]: boolean } = {}
@@ -346,6 +271,8 @@ local function mergeCycles(p: {number}, q: {number}): {number}?
 	for i = 1, #q do
 		local u, v = q[i], q[(i % #q) + 1]
 		if pEdge[v .. ">" .. u] then
+			-- never dissolve a real boundary
+			if edgeClass(u, v) ~= "internal" then return nil end
 			drop[u .. ">" .. v] = true
 			drop[v .. ">" .. u] = true
 			nShared += 1
@@ -366,9 +293,7 @@ local function mergeCycles(p: {number}, q: {number}): {number}?
 		end
 		return true
 	end
-	if not keep(p) then return nil end
-	if not keep(q) then return nil end
-	if count < 3 then return nil end
+	if not keep(p) or not keep(q) or count < 3 then return nil end
 
 	local startV: number? = nil
 	for u in pairs(nextOf) do startV = u; break end
@@ -391,20 +316,13 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 	local t0 = os.clock()
 	local polys: {Poly} = {}
 	local stats = {
-		regions = 0, triangles = 0, polys = 0, merges = 0,
-		slivers = 0, worstFatness = 1, areaIn = 0, areaOut = 0,
-		nonConvex = 0, maxVerts = 0,
-		triLoss = 0, triLossRegions = 0, worstTri = {}, degenerate = 0,
-		worstConvex = {},
+		regions = 0, polys = 0, rects = 0, fringe = 0, slivers = 0,
+		areaIn = 0, areaOut = 0, nonConvex = 0, maxVerts = 0, degenerate = 0, merges = 0,
+		rectArea = 0, fringeArea = 0, worstFatness = 1,
 	}
 
 	for _, r in ipairs(lres.regions) do
 		stats.regions += 1
-		-- Back into the floor's own 2D frame, taken from Loops rather than rebuilt
-		-- here. Deriving it from the part's CFrame is wrong for every rotated or
-		-- tilted floor, and the failure is silent: the ring projects onto a skewed
-		-- plane, ear clipping hits degenerate corners, and roughly half the map's
-		-- area quietly failed to become polygons.
 		local fr = r.frame
 		if not fr then continue end
 		local o, e1, e2 = fr.o, fr.u, fr.v
@@ -430,82 +348,286 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 			end
 			holes[#holes + 1] = hr
 		end
-		stats.areaIn += math.abs(areaOf(outer.pts))
-		for _, h in ipairs(holes) do stats.areaIn -= math.abs(areaOf(h.pts)) end
+		local regionArea = math.abs(areaOf(outer.pts))
+		for _, h in ipairs(holes) do regionArea -= math.abs(areaOf(h.pts)) end
+		stats.areaIn += regionArea
 
-		local ring = (#holes > 0) and bridgeHoles(outer, holes) or outer
-		local tris = earClip(ring, c)
-		stats.triangles += #tris
-		do
-			-- Triangulation must reproduce the ring's area. Ear clipping bails on a
-			-- degenerate remainder, and that loss is otherwise silent.
-			local ta = 0
-			for _, t in ipairs(tris) do
-				ta += math.abs(areaOf({ ring.pts[t[1]], ring.pts[t[2]], ring.pts[t[3]] }))
-			end
-			local want = math.abs(areaOf(ring.pts))
-			if want - ta > 0.01 then
-				stats.triLoss += (want - ta)
-				stats.triLossRegions += 1
-				if #stats.worstTri < 6 then
-					stats.worstTri[#stats.worstTri + 1] = string.format(
-						"%s ringVerts=%d holes=%d tris=%d ringArea=%.1f triArea=%.1f lost=%.1f",
-						r.floor.Name, #ring.pts, #holes, #tris, want, ta, want - ta)
-				end
+		type Seg = { a: V2, b: V2, class: string }
+		local bsegs: {Seg} = {}
+		local function addRing(rr: Ring)
+			for i = 1, #rr.pts do
+				local j = (i % #rr.pts) + 1
+				bsegs[#bsegs + 1] = { a = rr.pts[i], b = rr.pts[j], class = rr.cls[i] }
 			end
 		end
+		addRing(outer)
+		for _, h in ipairs(holes) do addRing(h) end
 
-		-- class of the directed edge (i -> j) where both are ring indices
-		local cls: { [string]: string } = {}
-		for i = 1, #ring.pts do
-			local j = (i % #ring.pts) + 1
-			cls[i .. ">" .. j] = ring.cls[i]
-		end
-		local function classOf(i: number, j: number): string
-			return cls[i .. ">" .. j] or "internal"
-		end
-
-		-- polygons as index cycles
-		local cyc: { {number}? } = {}
-		for _, t in ipairs(tris) do cyc[#cyc + 1] = { t[1], t[2], t[3] } end
-
-		local function ptsOf(cy: {number}): {V2}
-			local out = {}
-			for _, i in ipairs(cy) do out[#out + 1] = ring.pts[i] end
-			return out
+		local function inRegion(x: number, y: number): boolean
+			if not pointInPoly(outer.pts, x, y) then return false end
+			for _, h in ipairs(holes) do
+				if pointInPoly(h.pts, x, y) then return false end
+			end
+			return true
 		end
 
-		-- greedy: repeatedly take the convex merge with the fattest union
-		local improving = true
-		while improving do
-			improving = false
-			local bestA, bestB, bestCy, bestScore = nil, nil, nil, -1
-			-- shared-edge index
-			local owner: { [string]: number } = {}
-			for ci, cy in pairs(cyc) do
-				if cy then
-					for i = 1, #cy do
-						local u, v = cy[i], cy[(i % #cy) + 1]
-						owner[u .. ">" .. v] = ci
+		-- class of a cut that lies along a boundary edge, else "internal"
+		local function classFor(a: V2, b: V2): string
+			local mx, my = (a.x + b.x) * 0.5, (a.y + b.y) * 0.5
+			for _, s in ipairs(bsegs) do
+				local dx, dy = s.b.x - s.a.x, s.b.y - s.a.y
+				local L2 = dx * dx + dy * dy
+				if L2 > 1e-12 then
+					local t = ((mx - s.a.x) * dx + (my - s.a.y) * dy) / L2
+					if t >= -1e-6 and t <= 1 + 1e-6 then
+						local px, py = s.a.x + dx * t, s.a.y + dy * t
+						local ddx, ddy = mx - px, my - py
+						if ddx * ddx + ddy * ddy <= c.onEdgeEps * c.onEdgeEps then
+							return s.class
+						end
 					end
 				end
 			end
+			return "internal"
+		end
+
+		-- Pieces are collected, merged, and only then emitted.
+		local pieces: {{V2}} = {}
+		local pieceRect: {boolean} = {}
+		local function collect(pts: {V2}, isRect: boolean)
+			pieces[#pieces + 1] = pts
+			pieceRect[#pieces] = isRect
+		end
+
+		local function emit(pts: {V2}, isRect: boolean)
+			local a = math.abs(areaOf(pts))
+			if a < c.degenerateArea then stats.degenerate += 1; return end
+			local vs, cs = {}, {}
+			for i = 1, #pts do
+				vs[#vs + 1] = unproj(pts[i])
+				cs[#cs + 1] = classFor(pts[i], pts[(i % #pts) + 1])
+			end
+			local f = fatnessOf(pts)
+			if not isConvex(pts, c) then stats.nonConvex += 1 end
+			if f < c.minFatness then stats.slivers += 1 end
+			stats.worstFatness = math.min(stats.worstFatness, f)
+			stats.areaOut += a
+			stats.maxVerts = math.max(stats.maxVerts, #vs)
+			stats.polys += 1
+			if isRect then
+				stats.rects += 1; stats.rectArea += a
+			else
+				stats.fringe += 1; stats.fringeArea += a
+			end
+			polys[#polys + 1] = {
+				floor = r.floor, verts = vs, classes = cs,
+				area = a, fatness = f, rect = isRect,
+			}
+		end
+
+		----------------------------------------------------------------
+		-- lattice from the region's own vertex coordinates
+		----------------------------------------------------------------
+		local function axis(getter): {number}
+			local vals = {}
+			for _, s in ipairs(bsegs) do vals[#vals + 1] = getter(s.a) end
+			table.sort(vals)
+			local out = {}
+			for _, v in ipairs(vals) do
+				if #out == 0 or v - out[#out] > c.weldEps then out[#out + 1] = v end
+			end
+			return out
+		end
+		local xs = axis(function(p) return p.x end)
+		local ys = axis(function(p) return p.y end)
+		if #xs < 2 or #ys < 2 then continue end
+
+		local nx, ny = #xs - 1, #ys - 1
+		local w, h = {}, {}
+		for i = 1, nx do w[i] = xs[i + 1] - xs[i] end
+		for j = 1, ny do h[j] = ys[j + 1] - ys[j] end
+
+		-- A cell is FREE when its interior lies wholly inside the region: its
+		-- centre is inside and no boundary edge passes through it. An edge can
+		-- only cross a cell interior when it is not axis-aligned in this frame,
+		-- since every vertex coordinate is already a lattice line.
+		local free, partial = {}, {}
+		for i = 1, nx do
+			free[i] = {}
+			partial[i] = {}
+			local x0, x1 = xs[i], xs[i + 1]
+			for j = 1, ny do
+				local y0, y1 = ys[j], ys[j + 1]
+				-- Bounding-box overlap is not good enough: a single diagonal edge
+				-- overlaps the boxes of every cell in its span, which marked
+				-- hundreds of untouched cells as fringe. Clip the edge to the cell
+				-- and require the surviving piece to run through the INTERIOR,
+				-- not along a cell side.
+				local crossed = false
+				for _, s in ipairs(bsegs) do
+					local ca, cb = clipSeg(s.a, s.b, x0, y0, x1, y1)
+					if ca and cb then
+						local mx, my = (ca.x + cb.x) * 0.5, (ca.y + cb.y) * 0.5
+						if mx > x0 + 1e-6 and mx < x1 - 1e-6 and my > y0 + 1e-6 and my < y1 - 1e-6 then
+							crossed = true
+							break
+						end
+					end
+				end
+				local ins = inRegion((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+				free[i][j] = ins and not crossed
+				partial[i][j] = crossed
+			end
+		end
+
+		----------------------------------------------------------------
+		-- PHASE 1 — consume free cells with the largest rectangle available
+		----------------------------------------------------------------
+		while true do
+			local b = largestRect(free, w, h)
+			if b.area <= c.degenerateArea then break end
+			local jTop = b.jTop :: number
+			local acc, jBot = 0, jTop
+			for j = jTop, 1, -1 do
+				acc += h[j]
+				if acc >= (b.height :: number) - 1e-9 then jBot = j; break end
+			end
+			local x0, x1 = xs[b.i0 :: number], xs[(b.i1 :: number) + 1]
+			local y0, y1 = ys[jBot], ys[jTop + 1]
+			collect({
+				{ x = x0, y = y0 }, { x = x1, y = y0 },
+				{ x = x1, y = y1 }, { x = x0, y = y1 },
+			}, true)
+			for i = b.i0 :: number, b.i1 :: number do
+				for j = jBot, jTop do free[i][j] = false end
+			end
+		end
+
+		----------------------------------------------------------------
+		-- PHASE 2 — the fringe: cells a boundary edge crosses
+		----------------------------------------------------------------
+		for i = 1, nx do
+			for j = 1, ny do
+				if partial[i][j] then
+					local x0, x1, y0, y1 = xs[i], xs[i + 1], ys[j], ys[j + 1]
+					local segs = {
+						{ a = { x = x0, y = y0 }, b = { x = x1, y = y0 }, class = "internal" },
+						{ a = { x = x1, y = y0 }, b = { x = x1, y = y1 }, class = "internal" },
+						{ a = { x = x1, y = y1 }, b = { x = x0, y = y1 }, class = "internal" },
+						{ a = { x = x0, y = y1 }, b = { x = x0, y = y0 }, class = "internal" },
+					}
+					-- Only what this cell actually contains. Feeding the whole
+					-- region's edges in produced faces far larger than the cell,
+					-- which the centroid filter then let through, counting the same
+					-- ground several times (area came out 1350 studs^2 OVER).
+					for _, s in ipairs(bsegs) do
+						local ca, cb = clipSeg(s.a, s.b, x0, y0, x1, y1)
+						if ca and cb then
+							segs[#segs + 1] = { a = ca, b = cb, class = s.class }
+						end
+					end
+					local faces, halves, verts = Loops._traceFaces(Loops._splitAll(segs, c), c)
+					for _, f in ipairs(faces) do
+						if f.area > c.degenerateArea then
+							local cx, cy = 0, 0
+							for _, p in ipairs(f.pts) do cx += p.x; cy += p.y end
+							cx, cy = cx / #f.pts, cy / #f.pts
+							if cx > x0 - 1e-9 and cx < x1 + 1e-9
+								and cy > y0 - 1e-9 and cy < y1 + 1e-9
+								and inRegion(cx, cy) then
+								local pts = {}
+								for _, hi in ipairs(f.ring) do
+									pts[#pts + 1] = verts[halves[hi].from]
+								end
+								if isConvex(pts, c) then
+									collect(pts, false)
+								else
+									for _, tri in ipairs(earClip(pts, c)) do collect(tri, false) end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+
+		----------------------------------------------------------------
+		-- PHASE 3 — fuse pieces back together, fattest merge first.
+		--
+		-- Phase 1 leaves the rectangle grid it happened to consume, and phase 2
+		-- leaves a swarm around every obstacle whose edges are diagonal in this
+		-- floor's frame — which is most of them, since the buildings are rotated
+		-- relative to the floor they stand on. Both are cured by the same pass:
+		-- merge adjacent pieces whenever the union stays convex, taking the
+		-- FATTEST union available each time.
+		--
+		-- Ordering by fatness is what protects the shape. A merge that would
+		-- stretch a polygon scores below one that squares it off, so rectangles
+		-- fuse into bigger rectangles and fringe triangles fuse into compact
+		-- pieces, while the long thin unions simply never get chosen.
+		----------------------------------------------------------------
+		local vlist: {V2} = {}
+		local vkey: { [string]: number } = {}
+		local function vid(p: V2): number
+			local k = string.format("%d:%d",
+				math.floor(p.x / c.weldEps + 0.5), math.floor(p.y / c.weldEps + 0.5))
+			local id = vkey[k]
+			if not id then vlist[#vlist + 1] = p; id = #vlist; vkey[k] = id end
+			return id
+		end
+		local cyc: { {number}? } = {}
+		local cycRect: {boolean} = {}
+		for pi2, pts in ipairs(pieces) do
+			local cy = {}
+			for _, q2 in ipairs(pts) do
+				local id = vid(q2)
+				if cy[#cy] ~= id then cy[#cy + 1] = id end
+			end
+			if #cy >= 3 then
+				cyc[#cyc + 1] = cy
+				cycRect[#cyc] = pieceRect[pi2]
+			end
+		end
+
+		local clsCache: { [string]: string } = {}
+		local function edgeClass(u: number, v: number): string
+			local k = (u < v) and (u .. "_" .. v) or (v .. "_" .. u)
+			local got = clsCache[k]
+			if not got then
+				got = classFor(vlist[u], vlist[v])
+				clsCache[k] = got
+			end
+			return got
+		end
+		local function ptsOf(cy: {number}): {V2}
+			local out = {}
+			for _, i in ipairs(cy) do out[#out + 1] = vlist[i] end
+			return out
+		end
+
+		local improving = true
+		while improving do
+			improving = false
+			local owner: { [string]: number } = {}
+			for ci, cy in pairs(cyc) do
+				if cy then
+					for i = 1, #cy do owner[cy[i] .. ">" .. cy[(i % #cy) + 1]] = ci end
+				end
+			end
+			local bestA, bestB, bestCy, bestScore = nil, nil, nil, -1
 			for ci, cy in pairs(cyc) do
 				if cy then
 					for i = 1, #cy do
 						local u, v = cy[i], cy[(i % #cy) + 1]
 						local oj = owner[v .. ">" .. u]
-						if oj and oj ~= ci and (cyc[oj] ~= nil) then
-							-- never dissolve a real boundary edge
-							if classOf(u, v) == "internal" and classOf(v, u) == "internal" then
-								local m = mergeCycles(cy, cyc[oj] :: {number})
-								if m and #m >= 3 then
-									local mp = ptsOf(m)
-									if isConvex(mp, c) then
-										local s = fatnessOf(mp)
-										if s > bestScore then
-											bestScore, bestA, bestB, bestCy = s, ci, oj, m
-										end
+						if oj and oj ~= ci and cyc[oj] ~= nil and edgeClass(u, v) == "internal" then
+							local m = mergeCycles(cy, cyc[oj] :: {number}, edgeClass)
+							if m and #m >= 3 then
+								local mp = ptsOf(m)
+								if isConvex(mp, c) then
+									local sc = fatnessOf(mp)
+									if sc > bestScore then
+										bestScore, bestA, bestB, bestCy = sc, ci, oj, m
 									end
 								end
 							end
@@ -515,58 +637,33 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 			end
 			if bestCy then
 				cyc[bestA :: number] = bestCy
+				cycRect[bestA :: number] = cycRect[bestA :: number] and cycRect[bestB :: number]
 				cyc[bestB :: number] = nil
 				stats.merges += 1
 				improving = true
 			end
 		end
 
-		for _, cy in pairs(cyc) do
+		for ci, cy in pairs(cyc) do
 			if cy then
-				local pts = ptsOf(cy)
-				-- drop vertices that merging left mid-edge, but only when both
-				-- sides carry the same class, so a class boundary is never erased
-				local vs, cs = {}, {}
+				-- drop vertices merging left mid-edge, unless the class changes there
+				local keep = {}
 				for i = 1, #cy do
-					local prev = cy[((i - 2) % #cy) + 1]
-					local cur = cy[i]
-					local nxt = cy[(i % #cy) + 1]
-					local a, b, d = ring.pts[prev], ring.pts[cur], ring.pts[nxt]
+					local prev, cur, nxt = cy[((i - 2) % #cy) + 1], cy[i], cy[(i % #cy) + 1]
+					local a, b, d = vlist[prev], vlist[cur], vlist[nxt]
 					local turn = cross2(b.x - a.x, b.y - a.y, d.x - b.x, d.y - b.y)
-					local flat = math.abs(turn) <= c.collinearEps
-					if not (flat and classOf(prev, cur) == classOf(cur, nxt)) then
-						vs[#vs + 1] = unproj(ring.pts[cur])
-						cs[#cs + 1] = classOf(cur, nxt)
+					local flat = math.abs(turn) <= 1e-6
+					if not (flat and edgeClass(prev, cur) == edgeClass(cur, nxt)) then
+						keep[#keep + 1] = b
 					end
 				end
-				-- Bridge corridors are zero-width slits, so triangulation leaves a
-				-- few degenerate pieces along them. They carry no area and are not
-				-- navmesh; dropping them costs nothing (area conservation is
-				-- checked against areaIn either way).
-				local fp0 = {}
-				for _, i in ipairs(cy) do fp0[#fp0 + 1] = ring.pts[i] end
-				if math.abs(areaOf(fp0)) < c.degenerateArea then
-					stats.degenerate += 1
-				elseif #vs >= 3 then
-					local fp = {}
-					for _, i in ipairs(cy) do fp[#fp + 1] = ring.pts[i] end
-					local a = math.abs(areaOf(fp))
-					local f = fatnessOf(fp)
-					if not isConvex(fp, c) then
-						stats.nonConvex += 1
-						if #stats.worstConvex < 4 then
-							stats.worstConvex[#stats.worstConvex + 1] = string.format(
-								"%s verts=%d area=%.3f fat=%.4f", r.floor.Name, #fp, a, f)
-						end
-					end
-					if f < c.minFatness then stats.slivers += 1 end
-					stats.worstFatness = math.min(stats.worstFatness, f)
-					stats.areaOut += a
-					stats.maxVerts = math.max(stats.maxVerts, #vs)
-					polys[#polys + 1] = {
-						floor = r.floor, verts = vs, classes = cs, area = a, fatness = f,
-					}
-					stats.polys += 1
+				-- Collinear cleanup can tip a polygon over the convexity test when a
+				-- dropped vertex was carrying a hair of curvature; keep the full
+				-- cycle in that case rather than emit something concave.
+				if #keep >= 3 and isConvex(keep, c) then
+					emit(keep, cycRect[ci])
+				elseif #cy >= 3 then
+					emit(ptsOf(cy), cycRect[ci])
 				end
 			end
 		end
@@ -583,8 +680,6 @@ end
 
 --------------------------------------------------------------------------
 
--- Each polygon gets its own hue so neighbours are distinguishable, drawn as
--- edge bars; boundary edges keep their class colour, internal diagonals go dim.
 function Polys.visualize(res: any, parent: Instance?)
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
@@ -604,7 +699,8 @@ function Polys.visualize(res: any, parent: Instance?)
 	}
 	for pi, p in ipairs(res.polys) do
 		local sub = Instance.new("Folder")
-		sub.Name = string.format("P%d_%s_a%.0f_f%.2f", pi, p.floor.Name, p.area, p.fatness)
+		sub.Name = string.format("P%d_%s_%s_a%.0f_f%.2f",
+			pi, p.floor.Name, p.rect and "rect" or "fringe", p.area, p.fatness)
 		sub.Parent = folder
 		for i = 1, #p.verts do
 			local a = p.verts[i]
