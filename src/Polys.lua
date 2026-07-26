@@ -84,6 +84,12 @@ local DEFAULT = {
 	-- as the alternative and still win. Unbounded preference reproduces the fans.
 	reflexBonus = 0.25,
 
+	-- May a hole bridge land on a point along a boundary edge rather than only
+	-- on an existing vertex? The landing point lies ON a real boundary line, so
+	-- it satisfies the fill rule, and it is the difference between cutting to
+	-- the wall beside an obstacle and fanning to a corner 90 studs away.
+	bridgeToEdges = true,
+
 	-- NEGLIGIBLE-NOTCH DISCARD. The threshold is ABSOLUTE and tiny on purpose.
 	-- Width was removed from the bake because NPCs are not all human-sized and
 	-- sub-agent-width ground stays in the mesh; a discard threshold measured
@@ -353,12 +359,43 @@ local function bridgeHoles(outer: {V2}, holes: {{V2}}, c: any): {V2}
 	while #pending > 0 do
 		-- Take the hole whose best bridge is shortest, so short obvious bridges
 		-- are committed before long ones can get in their way.
+		--
+		-- Candidate landing points are ring vertices AND, when `bridgeToEdges` is
+		-- on, the foot of the perpendicular onto a ring edge. Vertices alone are
+		-- not enough: an obstacle standing in the middle of open floor has no
+		-- vertex near it, so it reaches for whatever corner is visible and the
+		-- bridge fans 90 studs across ground it should not touch. The foot lies
+		-- ON a real boundary line, which is where the fill rule puts vertices,
+		-- and inserting it splits that ring edge so no T-junction is created.
 		local bestHole, bestRi, bestHi, bestD = nil, nil, nil, math.huge
+		local bestFoot: V2? = nil
 		for hIdx, hole in ipairs(pending) do
 			for hi = 1, #hole do
 				local m = hole[hi]
+
+				local targets: {{ ri: number, p: V2, foot: boolean }} = {}
 				for ri = 1, #ring do
-					local v = ring[ri]
+					targets[#targets + 1] = { ri = ri, p = ring[ri], foot = false }
+				end
+				if c.bridgeToEdges then
+					for ri = 1, #ring do
+						local p, q = ring[ri], ring[(ri % #ring) + 1]
+						local dx, dy = q.x - p.x, q.y - p.y
+						local L2 = dx * dx + dy * dy
+						if L2 > 1e-9 then
+							local t = ((m.x - p.x) * dx + (m.y - p.y) * dy) / L2
+							if t > 1e-4 and t < 1 - 1e-4 then
+								targets[#targets + 1] = {
+									ri = ri, foot = true,
+									p = { x = p.x + dx * t, y = p.y + dy * t },
+								}
+							end
+						end
+					end
+				end
+
+				for _, tg in ipairs(targets) do
+					local v = tg.p
 					local dx, dy = v.x - m.x, v.y - m.y
 					local dist = dx * dx + dy * dy
 					if dist < bestD and dist > 1e-12 then
@@ -389,7 +426,8 @@ local function bridgeHoles(outer: {V2}, holes: {{V2}}, c: any): {V2}
 							end
 						end
 						if ok then
-							bestHole, bestRi, bestHi, bestD = hIdx, ri, hi, dist
+							bestHole, bestRi, bestHi, bestD = hIdx, tg.ri, hi, dist
+								bestFoot = tg.foot and tg.p or nil
 						end
 					end
 				end
@@ -405,6 +443,12 @@ local function bridgeHoles(outer: {V2}, holes: {{V2}}, c: any): {V2}
 
 		local hole = table.remove(pending, bestHole :: number) :: {V2}
 		local ri, hi = bestRi :: number, bestHi :: number
+		if bestFoot then
+			-- land on the edge itself: insert the foot as a real ring vertex so
+			-- the edge is split rather than crossed
+			table.insert(ring, ri + 1, bestFoot :: V2)
+			ri = ri + 1
+		end
 		local out: {V2} = {}
 		for i = 1, ri do out[#out + 1] = ring[i] end
 		for k = 0, #hole - 1 do out[#out + 1] = hole[((hi - 1 + k) % #hole) + 1] end
