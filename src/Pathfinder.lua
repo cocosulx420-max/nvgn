@@ -48,6 +48,7 @@ local DEFAULT = {
 	maxStepUp = 2.2,     -- a Roblox humanoid auto-steps 2; a little slack for authored lips
 	maxStepDown = 8,     -- dropping is cheap; this is not a fall-damage model
 	stepProbe = 1.0,     -- how far past the edge to look for the other surface
+	stepSample = 4,      -- probe every this many studs ALONG an edge, not once at its midpoint
 }
 
 local function merged(cfg): any
@@ -151,24 +152,35 @@ function Pathfinder.linkSteps(mesh: any, cfg: Config?): number
 				local n = outwardNormal(p, k)
 				if n then
 					local a, b = p.verts[k], p.verts[(k % #p.verts) + 1]
-					local mid = (a + b) * 0.5
 					local span = (b - a).Magnitude
-					local probe = mid + n * c.stepProbe
-					for j, q in ipairs(mesh.polys) do
-						if j ~= i and containsXZ(q.verts, probe.X, probe.Z) then
-							local dy = heightAt(q.verts, probe.X, probe.Z) - mid.Y
-							if dy <= c.maxStepUp and dy >= -c.maxStepDown then
-								local key = (i < j) and (i .. ":" .. j) or (j .. ":" .. i)
-								if not seen[key] then
-									seen[key] = true
-									mesh.portals[#mesh.portals + 1] = {
-										a = i, b = j, p1 = a, p2 = b,
-										length = span, class = "step", kind = "step",
-									}
-									local pi = #mesh.portals
-									table.insert(mesh.neighbours[i], { poly = j, portal = pi, climb = dy })
-									table.insert(mesh.neighbours[j], { poly = i, portal = pi, climb = -dy })
-									added += 1
+					-- SAMPLE ALONG THE EDGE, not just its midpoint. Polygons here
+					-- are large -- a single floor is often one polygon with 90+
+					-- stud edges -- so a neighbour touching a short stretch of a
+					-- long edge is invisible to a midpoint probe. That is exactly
+					-- what severed an entire upper storey: an 800 stud^2 slab met
+					-- a 3255 stud^2 slab at the same height, over 20 studs of a
+					-- 93-stud edge, and the midpoint landed nowhere near it.
+					local steps = math.max(1, math.ceil(span / c.stepSample))
+					for s = 0, steps do
+						local t = (s + 0.5) / (steps + 1)
+						local at = a + (b - a) * t
+						local probe = at + n * c.stepProbe
+						for j, q in ipairs(mesh.polys) do
+							if j ~= i and containsXZ(q.verts, probe.X, probe.Z) then
+								local dy = heightAt(q.verts, probe.X, probe.Z) - at.Y
+								if dy <= c.maxStepUp and dy >= -c.maxStepDown then
+									local key = (i < j) and (i .. ":" .. j) or (j .. ":" .. i)
+									if not seen[key] then
+										seen[key] = true
+										mesh.portals[#mesh.portals + 1] = {
+											a = i, b = j, p1 = a, p2 = b,
+											length = span, class = "step", kind = "step",
+										}
+										local pi = #mesh.portals
+										table.insert(mesh.neighbours[i], { poly = j, portal = pi, climb = dy })
+										table.insert(mesh.neighbours[j], { poly = i, portal = pi, climb = -dy })
+										added += 1
+									end
 								end
 							end
 						end
