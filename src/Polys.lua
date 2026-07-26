@@ -327,20 +327,60 @@ local function isConvex(pts: {V2}, c: any): boolean
 	return true
 end
 
--- Splice two index cycles that share exactly the edge (u, v).
-local function spliceCycles(p: {number}, q: {number}, u: number, v: number): {number}?
-	local pi, qi = nil, nil
-	for i = 1, #p do
-		if p[i] == u and p[(i % #p) + 1] == v then pi = i break end
-	end
+-- Merge two adjacent cycles across EVERY edge they share, not just one.
+--
+-- Rather than reason about where a shared chain starts and ends, drop the shared
+-- edges and re-chain what remains. If the leftovers form exactly one closed
+-- cycle the merge is valid; anything else — a non-contiguous chain, which would
+-- pinch or disconnect the union — fails the walk and is rejected.
+--
+-- An edge counts as shared only when THIS cycle has (u,v) and the OTHER has
+-- (v,u). Testing both directions against one combined set instead marks a
+-- polygon's own edges as shared and discards everything, quietly turning the
+-- whole merge pass into a no-op.
+local function mergeCycles(p: {number}, q: {number}): {number}?
+	local pEdge: { [string]: boolean } = {}
+	for i = 1, #p do pEdge[p[i] .. ">" .. p[(i % #p) + 1]] = true end
+	local drop: { [string]: boolean } = {}
+	local nShared = 0
 	for i = 1, #q do
-		if q[i] == v and q[(i % #q) + 1] == u then qi = i break end
+		local u, v = q[i], q[(i % #q) + 1]
+		if pEdge[v .. ">" .. u] then
+			drop[u .. ">" .. v] = true
+			drop[v .. ">" .. u] = true
+			nShared += 1
+		end
 	end
-	if not pi or not qi then return nil end
-	local out = {}
-	-- p from v onward, up to u
-	for k = 1, #p - 1 do out[#out + 1] = p[(((pi :: number) % #p) + k - 1) % #p + 1] end
-	for k = 1, #q - 1 do out[#out + 1] = q[(((qi :: number) % #q) + k - 1) % #q + 1] end
+	if nShared == 0 then return nil end
+
+	local nextOf: { [number]: number } = {}
+	local count = 0
+	local function keep(cy: {number}): boolean
+		for i = 1, #cy do
+			local u, v = cy[i], cy[(i % #cy) + 1]
+			if not drop[u .. ">" .. v] then
+				if nextOf[u] then return false end -- vertex leaving twice: pinched
+				nextOf[u] = v
+				count += 1
+			end
+		end
+		return true
+	end
+	if not keep(p) then return nil end
+	if not keep(q) then return nil end
+	if count < 3 then return nil end
+
+	local startV: number? = nil
+	for u in pairs(nextOf) do startV = u; break end
+	local out, cur, guard = {}, startV :: number, 0
+	repeat
+		out[#out + 1] = cur
+		local nx = nextOf[cur]
+		if not nx then return nil end
+		cur = nx
+		guard += 1
+	until cur == startV or guard > count + 2
+	if #out ~= count then return nil end
 	return out
 end
 
@@ -458,7 +498,7 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 						if oj and oj ~= ci and (cyc[oj] ~= nil) then
 							-- never dissolve a real boundary edge
 							if classOf(u, v) == "internal" and classOf(v, u) == "internal" then
-								local m = spliceCycles(cy, cyc[oj] :: {number}, u, v)
+								local m = mergeCycles(cy, cyc[oj] :: {number})
 								if m and #m >= 3 then
 									local mp = ptsOf(m)
 									if isConvex(mp, c) then
