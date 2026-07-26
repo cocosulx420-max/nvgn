@@ -50,6 +50,11 @@ local DEFAULT = {
 	stepProbe = 1.0,     -- how far past the edge to look for the other surface
 	stepSample = 4,      -- probe every this many studs ALONG an edge, not once at its midpoint
 
+	-- Reject links whose two surfaces have solid geometry between them. Off
+	-- reproduces the old behaviour exactly, which is what makes it measurable.
+	validateLinks = true,
+	blockProbe = 1.0,    -- how far ABOVE the higher of the two surfaces to test
+
 	-- How closely a smoothed segment must hug the corridor surface. Slack here
 	-- is what lets a shortcut float above the ground it is supposed to follow.
 	corridorSample = 1.0,
@@ -162,6 +167,68 @@ local function centroidOf(verts: {Vector3}): Vector3
 	return s / #verts
 end
 
+--------------------------------------------------------------------------
+-- TRAVERSABILITY
+--
+-- A portal says two polygons share ground. It does not say an agent can get
+-- from one to the other, and nothing in the pipeline was checking.
+--
+-- `linkSteps` builds a step from any `wall` or `dropoff` edge by probing
+-- `stepProbe` past it and comparing HEIGHTS ONLY. A wall with floor on the far
+-- side satisfies that test perfectly, so it yields a link straight THROUGH the
+-- wall; geometric portal matching does the same across a shared wall. Measured
+-- on a 12,571-part map: 15% of links crossed solid geometry and 93% of routes
+-- used at least one, which is what "the path goes through a block" looks like
+-- from inside the game.
+--
+-- THE RAY RUNS AT A HEIGHT ABOVE BOTH SURFACES. That is the whole
+-- discriminator. A stair riser never reaches above its own upper tread, so a
+-- real step is never rejected, while a wall standing on the boundary always
+-- is. Testing at a fixed height above the LOWER surface instead would clip
+-- every riser and reject every staircase in the map -- an earlier version of
+-- this audit did exactly that and over-reported by 91 links.
+--
+-- Raycasts rather than the SVO, deliberately, and for the same reason
+-- clearance already uses a raycast instead of SVO stepping: the SVO is a
+-- conservative 1-stud voxelisation, and over-voxelisation corrupts precisely
+-- the sub-voxel question being asked here -- the edges of a legitimate
+-- doorway, or a thin wall sitting inside a voxel. The SVO's documented job is
+-- broad phase, never the mesh. A ray is exact, and at runtime it tracks
+-- destruction for free.
+--------------------------------------------------------------------------
+
+local blockRP: RaycastParams? = nil
+local function blockParams(): RaycastParams
+	if blockRP then return blockRP :: RaycastParams end
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	-- debug parts are CanQuery off already, but the folders are excluded
+	-- explicitly so a stray visible marker can never sever a real link
+	local skip: {Instance} = {}
+	for _, name in ipairs({ "NVGN_Debug", "NVGN_PathDemo" }) do
+		local f = workspace:FindFirstChild(name)
+		if f then skip[#skip + 1] = f end
+	end
+	rp.FilterDescendantsInstances = skip
+	rp.RespectCanCollide = true
+	blockRP = rp
+	return rp
+end
+
+-- Call if the world changed (destruction) and the excluded folders moved.
+function Pathfinder.resetBlockCache()
+	blockRP = nil
+end
+
+local function blockedBetween(a: Vector3, b: Vector3, c: any): boolean
+	local h = math.max(a.Y, b.Y) + c.blockProbe
+	local from = Vector3.new(a.X, h, a.Z)
+	local to = Vector3.new(b.X, h, b.Z)
+	local d = to - from
+	if d.Magnitude < 1e-3 then return false end
+	return workspace:Raycast(from, d, blockParams()) ~= nil
+end
+
 local function distToSegment(px: number, pz: number, a: Vector3, b: Vector3): number
 	local dx, dz = b.X - a.X, b.Z - a.Z
 	local l2 = dx * dx + dz * dz
@@ -246,8 +313,20 @@ function Pathfinder.linkSteps(mesh: any, cfg: Config?): number
 						for _, j in ipairs(polysAt(idx, probe.X, probe.Z, POLY_CELL)) do
 							local q = mesh.polys[j]
 							if j ~= i and containsXZ(q.verts, probe.X, probe.Z) then
-								local dy = heightAt(q.verts, probe.X, probe.Z) - at.Y
-								if dy <= c.maxStepUp and dy >= -c.maxStepDown then
+								local qy = heightAt(q.verts, probe.X, probe.Z)
+								local dy = qy - at.Y
+								-- Rejected PER SAMPLE, not per edge, which falls out of
+								-- the tmin/tmax machinery already here: where a wall runs
+								-- along most of an edge but a doorway opens partway
+								-- along it, the blocked samples drop out and the portal
+								-- spans the opening only -- the same "make the portal the
+								-- ground you can actually cross" rule that sizing the
+								-- portal to the real contact was already enforcing.
+								local reachable = true
+								if c.validateLinks then
+									reachable = not blockedBetween(at, Vector3.new(probe.X, qy, probe.Z), c)
+								end
+								if reachable and dy <= c.maxStepUp and dy >= -c.maxStepDown then
 									local h = hits[j]
 									if not h then
 										hits[j] = { tmin = t, tmax = t, dySum = dy, n = 1 }
@@ -317,6 +396,44 @@ local function stripStepLinks(mesh: any)
 	end
 end
 
+-- The same rule applied to the portals the BAKE produced. Step links are
+-- validated where they are created (above); these already exist by the time the
+-- pathfinder sees them, so they are pruned instead.
+--
+-- This is the pathfinder's copy of a rule that belongs in `Portals.lua`, so a
+-- loaded artefact would already be honest and every consumer would benefit
+-- rather than each re-deriving it. Kept here for now because this is the test
+-- harness and pruning is measurable against an unpruned graph.
+local function pruneBlockedPortals(mesh: any, c: any): number
+	local removed = 0
+	local cent = mesh._pf.centroids
+	for i = 1, #mesh.polys do
+		local list = mesh.neighbours[i] or {}
+		local out = {}
+		for _, nb in ipairs(list) do
+			local keep = true
+			-- step links carry `climb` and were already checked at creation
+			if nb.climb == nil then
+				local pt = mesh.portals[nb.portal]
+				if pt then
+					local mid = (pt.p1 + pt.p2) * 0.5
+					local da = cent[i] - mid
+					local db = cent[nb.poly] - mid
+					da = (da.Magnitude > 1e-3) and da.Unit or Vector3.zero
+					db = (db.Magnitude > 1e-3) and db.Unit or Vector3.zero
+					if blockedBetween(mid + da * 0.6, mid + db * 0.6, c) then
+						keep = false
+						removed += 1
+					end
+				end
+			end
+			if keep then out[#out + 1] = nb end
+		end
+		mesh.neighbours[i] = out
+	end
+	return removed
+end
+
 -- Prepares the derived tables a query needs. Safe to call again to re-target a
 -- different agent.
 function Pathfinder.prepare(mesh: any, cfg: Config?): any
@@ -328,6 +445,7 @@ function Pathfinder.prepare(mesh: any, cfg: Config?): any
 	-- thousands of times, and `locate` runs every frame the demo re-paths
 	mesh._pf = { centroids = centroids, config = c, polyIndex = polyIndex(mesh.polys, POLY_CELL) }
 	mesh._pf.stepLinks = c.linkSteps and Pathfinder.linkSteps(mesh, c) or 0
+	mesh._pf.blockedPortals = c.validateLinks and pruneBlockedPortals(mesh, c) or 0
 	return mesh
 end
 
