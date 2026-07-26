@@ -265,6 +265,16 @@ Polygon thinness is measured **relative to the ground the polygon sits on**, nev
 
 Discarded notches leave polygon edges slightly *inside* `Clean`'s lines in places, so the two will not always coincide. The viz must draw both, or a polygon edge sitting a quarter stud off a wall bar reads as a bug when it is the design.
 
+### Assembly — `src/Navmesh.lua`
+
+Each stage could previously build its own inputs (`Loops.build` → `Clean.build` → `LocalGrid.build`), which is convenient during development and wasteful once every stage is real: running through `Polys.build` and then asking for clearance volumes rebuilt the **entire local grid a second time**, since `Volumes.build` also starts from scratch. `NVGN.Navmesh` builds each stage exactly once and passes results forward. Measured on the test scene: 2.61s total, of which LocalGrid is 2.30s and everything downstream — Clean 0.13, Loops 0.03, Polys 0.13, Portals 0.002, Volumes 0.01, clearance 0.001 — is under 0.31s combined.
+
+It is also where **clearance is attached to polygons**, which nothing was doing. Volumes do not split polygons (polygonization runs in abstraction of them), so the attachment is the per-polygon scalar `Volumes.minClearanceOverPoly`: the lowest clearance any volume imposes anywhere over that polygon's area. `math.huge` means no volume reaches the polygon at all — headroom is at least the volume cap — and must never be read as zero.
+
+Test scene: 19 of 160 polygons restricted, covering 12.9% of walkable area, lowest 1.70. The largest restricted polygon is 1012 studs².
+
+**Known conservatism, unchanged by this.** The scalar is a **pre-filter**, not the whole answer. A polygon only partly covered by a low volume is no longer atomic, so a tall agent is excluded from all 1012 studs² even where the low patch is a corner of it. Hard exclusion uses the scalar; mode selection (walk/crouch/crawl cost) works off the smoothed corridor and the volume index directly, which is why the index must be searched during A\* rather than consulted on contact.
+
 ## Agents & sizing
 
 Two dimensions decide whether an agent fits: **clearance** (vertical) and **width** (`2 × radius`, horizontal). Only **clearance** is baked — a per-surfel/per-polygon annotation, because vertical headroom can't be recovered from the 2D geometry. **Width is never baked and is not a generation concern at all.** It is resolved entirely at **pathfinding time**, by the pathfinder, using the navmesh (portal shared-edge length, a poly's opposing boundary edges) together with **SVO** solid queries. The generator emits nothing width-related — no field, no annotation, no split.
