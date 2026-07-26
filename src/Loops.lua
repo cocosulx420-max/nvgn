@@ -49,6 +49,11 @@ export type Region = {
 	area: number,
 	cells: number,        -- live mask cells inside
 	holes: {{LoopEdge}},   -- inner rings: obstacles standing on this floor
+	-- The floor's own surface frame. Downstream stages must NOT rebuild this
+	-- from the part's CFrame: a tilted or yawed floor's walkable normal is not
+	-- the part's UpVector, and projecting on the wrong plane silently shrinks
+	-- every polygon derived from it.
+	frame: { o: Vector3, u: Vector3, v: Vector3, n: Vector3 },
 }
 export type Config = {
 	weldEps: number?, minArea: number?, minCellsPerFace: number?,
@@ -424,6 +429,7 @@ function Loops.fromClean(result: any, data: any, cfg: Config?)
 						regions[#regions + 1] = {
 							floor = part, edges = ring, verts = vs,
 							area = f.area - holeArea, cells = n, holes = holes,
+							frame = { o = center, u = u, v = v, n = g.n or Vector3.new(0, 1, 0) },
 						}
 						stats.kept += 1
 
