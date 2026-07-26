@@ -48,7 +48,7 @@ export type Region = {
 	verts: {Vector3},
 	area: number,
 	cells: number,        -- live mask cells inside
-	holes: {{Vector3}},
+	holes: {{LoopEdge}},   -- inner rings: obstacles standing on this floor
 }
 export type Config = {
 	weldEps: number?, minArea: number?, minCellsPerFace: number?,
@@ -283,6 +283,13 @@ function Loops.fromClean(result: any, data: any, cfg: Config?)
 	local stats = {
 		floors = 0, faces = 0, kept = 0, discardedEmpty = 0, discardedTiny = 0,
 		openFloors = 0, continuationStuds = 0, boundaryStuds = 0,
+		holes = 0, unbounded = 0,
+		-- Validation. A region's area should be covered by its live cells. If it
+		-- substantially exceeds them, the region is claiming ground nothing stands
+		-- on — the signature of an obstacle whose ring failed to close, which the
+		-- hole logic cannot see because an unclosed ring merges into the
+		-- surrounding face and simply vanishes.
+		areaTotal = 0, cellArea = 0, worstSlack = 0, worstFloor = nil,
 	}
 
 	for part, g in pairs(data.grids) do
@@ -340,6 +347,64 @@ function Loops.fromClean(result: any, data: any, cfg: Config?)
 				end
 			end
 
+			-- HOLES. An obstacle standing in the middle of a floor does not cut
+			-- the region — you walk around it — so its boundary never reaches the
+			-- rim and cannot separate faces. It appears instead as a disconnected
+			-- component, which the walk emits as a MIRRORED PAIR of cycles: one
+			-- positive (the obstacle's own interior, where nothing stands) and one
+			-- negative (the same ring seen from the walkable side). The negative
+			-- cycle is the hole.
+			--
+			-- Attach each negative cycle to the SMALLEST positive cycle that
+			-- contains it, which is what makes nesting work: a courtyard inside a
+			-- building attaches to the building's interior rather than jumping out
+			-- to the floor. The container must be strictly LARGER in area, which
+			-- excludes the cycle's own mirror without needing a tolerance — the
+			-- mirror has exactly equal area by construction.
+			local function ringPts(f: any): {V2}
+				return f.pts
+			end
+			local holesFor: { [number]: {number} } = {}
+			for ni, nf in ipairs(faces) do
+				if nf.area < 0 and #nf.pts > 0 then
+					local probe = nf.pts[1]
+					local best, bestArea = nil, math.huge
+					for pi, pf in ipairs(faces) do
+						if pf.area > 0 and pf.area > -nf.area + c.minArea
+							and pointInPoly(ringPts(pf), probe.x, probe.y) then
+							if pf.area < bestArea then best, bestArea = pi, pf.area end
+						end
+					end
+					if best then
+						local b = holesFor[best]
+						if not b then b = {}; holesFor[best] = b end
+						b[#b + 1] = ni
+						stats.holes += 1
+					else
+						-- contained by nothing: this is the unbounded face
+						stats.unbounded += 1
+					end
+				end
+			end
+
+			local function ringOf(f: any): ({LoopEdge}, {Vector3})
+				local ring: {LoopEdge} = {}
+				local vs: {Vector3} = {}
+				for _, hi in ipairs(f.ring) do
+					local h = halves[hi]
+					local a3, b3 = unproj(verts[h.from]), unproj(verts[h.to])
+					ring[#ring + 1] = { class = h.class, source = h.source, a = a3, b = b3 }
+					vs[#vs + 1] = a3
+					local L = (b3 - a3).Magnitude
+					if h.class == "continuation" then
+						stats.continuationStuds += L
+					else
+						stats.boundaryStuds += L
+					end
+				end
+				return ring, vs
+			end
+
 			for fi, f in ipairs(faces) do
 				if f.area > 0 then
 					local n = cellsIn[fi] or 0
@@ -348,25 +413,29 @@ function Loops.fromClean(result: any, data: any, cfg: Config?)
 					elseif math.abs(f.area) < c.minArea then
 						stats.discardedTiny += 1
 					else
-						local ring: {LoopEdge} = {}
-						local vs: {Vector3} = {}
-						for _, hi in ipairs(f.ring) do
-							local h = halves[hi]
-							local a3, b3 = unproj(verts[h.from]), unproj(verts[h.to])
-							ring[#ring + 1] = { class = h.class, source = h.source, a = a3, b = b3 }
-							vs[#vs + 1] = a3
-							local L = (b3 - a3).Magnitude
-							if h.class == "continuation" then
-								stats.continuationStuds += L
-							else
-								stats.boundaryStuds += L
-							end
+						local ring, vs = ringOf(f)
+						local holes: {{LoopEdge}} = {}
+						local holeArea = 0
+						for _, ni in ipairs(holesFor[fi] or {}) do
+							local hr = ringOf(faces[ni])
+							holes[#holes + 1] = hr
+							holeArea += -faces[ni].area
 						end
 						regions[#regions + 1] = {
 							floor = part, edges = ring, verts = vs,
-							area = math.abs(f.area), cells = n, holes = {},
+							area = f.area - holeArea, cells = n, holes = holes,
 						}
 						stats.kept += 1
+
+						local step = g.step or 1
+						local cellArea = n * step * step
+						local slack = (f.area - holeArea) - cellArea
+						stats.areaTotal += (f.area - holeArea)
+						stats.cellArea += cellArea
+						if slack > stats.worstSlack then
+							stats.worstSlack = slack
+							stats.worstFloor = part.Name
+						end
 					end
 				end
 			end
@@ -404,22 +473,28 @@ function Loops.visualize(res: any, parent: Instance?)
 	local UP = Vector3.new(0, 1, 0)
 	for ri, r in ipairs(res.regions) do
 		local sub = Instance.new("Folder")
-		sub.Name = string.format("R%d_%s_c%d", ri, r.floor.Name, r.cells)
+		sub.Name = string.format("R%d_%s_c%d_h%d", ri, r.floor.Name, r.cells, #r.holes)
 		sub.Parent = folder
-		for _, e in ipairs(r.edges) do
+		local function draw(e, thick, tag)
 			local d = e.b - e.a
 			local len = d.Magnitude
 			if len > 1e-3 then
 				local p = Instance.new("Part")
 				p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
-				p.Size = Vector3.new(len, 0.25, 0.25)
+				p.Size = Vector3.new(len, thick, thick)
 				p.Color = colours[e.class] or Color3.new(1, 1, 1)
 				p.Material = Enum.Material.Neon
 				p.Transparency = (e.class == "continuation") and 0.45 or 0
 				p.CFrame = CFrame.fromMatrix((e.a + e.b) * 0.5 + UP * 0.1, d.Unit, UP)
-				p.Name = e.class
+				p.Name = tag .. e.class
 				p.Parent = sub
 			end
+		end
+		for _, e in ipairs(r.edges) do draw(e, 0.25, "") end
+		-- inner rings drawn fatter and lifted, so an obstacle reads as a hole
+		-- rather than as another outer boundary lying on top of it
+		for _, h in ipairs(r.holes) do
+			for _, e in ipairs(h) do draw(e, 0.4, "hole_") end
 		end
 	end
 	return folder
