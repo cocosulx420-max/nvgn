@@ -54,6 +54,7 @@ export type Poly = {
 export type Config = {
 	weldEps: number?, convexEps: number?, minFatness: number?,
 	degenerateArea: number?, onEdgeEps: number?,
+	minWidth: number?, maxAspect: number?,
 }
 
 local DEFAULT = {
@@ -61,7 +62,17 @@ local DEFAULT = {
 	-- subdivision, and a different weld would close faces differently.
 	weldEps = 0.02,
 	convexEps = 1e-4,
-	-- Reporting threshold only. Dropping thin polygons would punch holes.
+	-- HARD SHAPE LIMITS, enforced by the repair pass, not merely preferred.
+	--
+	-- A polygon's width is taken as area / longest edge — the average thickness
+	-- of the strip it occupies — and its aspect as longest edge / that width.
+	-- Anything thinner or longer than these is absorbed into a neighbour if any
+	-- convex union will take it. Some ground is genuinely a 0.5-stud ledge, so
+	-- violations that survive are reported rather than deleted: dropping them
+	-- would punch holes in the mesh.
+	minWidth = 1.5,
+	maxAspect = 5,
+	-- Reporting threshold only.
 	minFatness = 0.15,
 	degenerateArea = 1e-3,
 	-- How close a cut must lie to a boundary edge to inherit its class.
@@ -99,6 +110,24 @@ local function perimOf(pts: {V2}): number
 		p += math.sqrt(dx * dx + dy * dy)
 	end
 	return p
+end
+
+-- Width = area / longest edge (mean thickness of the strip), aspect = longest
+-- edge / width. These are what the limits are stated in, because they say
+-- directly what is wrong with a bad polygon: too thin to stand in, or too long
+-- for its thickness.
+local function shapeOf(pts: {V2}): (number, number)
+	local a = math.abs(areaOf(pts))
+	local longest = 0
+	for i = 1, #pts do
+		local j = (i % #pts) + 1
+		local dx, dy = pts[j].x - pts[i].x, pts[j].y - pts[i].y
+		longest = math.max(longest, math.sqrt(dx * dx + dy * dy))
+	end
+	if longest <= 1e-9 then return 0, math.huge end
+	local width = a / longest
+	if width <= 1e-9 then return 0, math.huge end
+	return width, longest / width
 end
 
 local function fatnessOf(pts: {V2}): number
@@ -197,12 +226,19 @@ local function earClip(pts: {V2}, c: any): {{V2}}
 					if q ~= a and q ~= b and q ~= d and pointInTri(q, a, b, d) then ok = false; break end
 				end
 				if ok then
-					-- prefer the ear whose shortest side is longest, which keeps
-					-- fringe pieces compact rather than needle-like
-					local s = math.min(
-						(b.x - a.x) ^ 2 + (b.y - a.y) ^ 2,
-						math.min((d.x - b.x) ^ 2 + (d.y - b.y) ^ 2,
-							(a.x - d.x) ^ 2 + (a.y - d.y) ^ 2))
+					-- Score by the ear's SMALLEST ANGLE, not by side length. A
+					-- long-sided triangle can still be a needle; the angle is what
+					-- actually predicts it, and needles are what the limits below
+					-- then have to clean up.
+					local function ang(p1: V2, p2: V2, p3: V2): number
+						local ux, uy = p1.x - p2.x, p1.y - p2.y
+						local vx, vy = p3.x - p2.x, p3.y - p2.y
+						local lu = math.sqrt(ux * ux + uy * uy)
+						local lv = math.sqrt(vx * vx + vy * vy)
+						if lu < 1e-12 or lv < 1e-12 then return 0 end
+						return math.acos(math.clamp((ux * vx + uy * vy) / (lu * lv), -1, 1))
+					end
+					local s = math.min(ang(d, a, b), math.min(ang(a, b, d), ang(b, d, a)))
 					if s > bestScore then bestScore, bestK = s, k end
 				end
 			end
@@ -317,7 +353,8 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 	local polys: {Poly} = {}
 	local stats = {
 		regions = 0, polys = 0, rects = 0, fringe = 0, slivers = 0,
-		areaIn = 0, areaOut = 0, nonConvex = 0, maxVerts = 0, degenerate = 0, merges = 0,
+		areaIn = 0, areaOut = 0, nonConvex = 0, maxVerts = 0, degenerate = 0, merges = 0, repaired = 0, unfixable = 0,
+		tooThin = 0, tooLong = 0,
 		rectArea = 0, fringeArea = 0, worstFatness = 1,
 	}
 
@@ -408,6 +445,9 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 				cs[#cs + 1] = classFor(pts[i], pts[(i % #pts) + 1])
 			end
 			local f = fatnessOf(pts)
+			local wdt, asp = shapeOf(pts)
+			if wdt < c.minWidth then stats.tooThin += 1 end
+			if asp > c.maxAspect then stats.tooLong += 1 end
 			if not isConvex(pts, c) then stats.nonConvex += 1 end
 			if f < c.minFatness then stats.slivers += 1 end
 			stats.worstFatness = math.min(stats.worstFatness, f)
@@ -641,6 +681,167 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 				cyc[bestB :: number] = nil
 				stats.merges += 1
 				improving = true
+			end
+		end
+
+		----------------------------------------------------------------
+		-- PHASE 4 — REPAIR. Enforce the shape limits.
+		--
+		-- Phase 3 only PREFERS fat unions; it stops as soon as no merge improves
+		-- fatness, which leaves any piece whose every union is worse than it is —
+		-- exactly the thin stretched ones. So make a second pass whose acceptance
+		-- test is different: for a polygon that breaks the limits, take any convex
+		-- union that reduces the violation, even if the union scores worse on
+		-- fatness than some other polygon would.
+		--
+		-- A violator with no convex neighbour to join is genuine thin ground (a
+		-- 0.5-stud ledge, the strip between a clipramp seam and a rim). Those are
+		-- left and counted, because deleting them would open holes.
+		----------------------------------------------------------------
+		local function violation(pts: {V2}): number
+			local wdt, asp = shapeOf(pts)
+			local v = 0
+			if wdt < c.minWidth then v += (c.minWidth - wdt) / c.minWidth end
+			if asp > c.maxAspect then v += (asp - c.maxAspect) / c.maxAspect end
+			return v
+		end
+
+		-- Merging alone cannot fix this. Phase 3 stops precisely where every
+		-- remaining union is non-convex, so a repair pass that also demands
+		-- convexity finds nothing to do — measured: 0 repairs, 83 too-thin and
+		-- 116 too-long polygons left standing.
+		--
+		-- So repair RE-DECOMPOSES. Merge the violator with a neighbour even though
+		-- the union is concave, then split that union afresh into convex pieces,
+		-- and keep the result only when the WORST shape among the new pieces beats
+		-- the worst among the two originals. The union is a local, bounded region,
+		-- so this is cheap, and it can escape the arrangement the lattice happened
+		-- to impose — which merging never can, because it may only delete cuts,
+		-- never move them.
+		local function redecompose(cy: {number}): {{number}}?
+			local pts, back = {}, {}
+			for k, id in ipairs(cy) do
+				pts[k] = vlist[id]
+				back[k] = id
+			end
+			local tris = earClip(pts, c)
+			if #tris == 0 then return nil end
+			-- ear clipping returns points; map them back to vertex ids
+			local idOf: { [V2]: number } = {}
+			for k, pt in ipairs(pts) do idOf[pt] = back[k] end
+			local out: { {number}? } = {}
+			for _, t in ipairs(tris) do
+				local cyi = {}
+				for _, pt in ipairs(t) do
+					local id = idOf[pt]
+					if not id then return nil end
+					cyi[#cyi + 1] = id
+				end
+				out[#out + 1] = cyi
+			end
+			-- fuse the fresh triangles back up, fattest first
+			local going = true
+			while going do
+				going = false
+				local own: { [string]: number } = {}
+				for ci2, q2 in pairs(out) do
+					if q2 then
+						for i = 1, #q2 do own[q2[i] .. ">" .. q2[(i % #q2) + 1]] = ci2 end
+					end
+				end
+				local bA, bB, bC, bS = nil, nil, nil, -1
+				for ci2, q2 in pairs(out) do
+					if q2 then
+						for i = 1, #q2 do
+							local u, v = q2[i], q2[(i % #q2) + 1]
+							local oj = own[v .. ">" .. u]
+							if oj and oj ~= ci2 and out[oj] ~= nil and edgeClass(u, v) == "internal" then
+								local m = mergeCycles(q2, out[oj] :: {number}, edgeClass)
+								if m and #m >= 3 then
+									local mp = ptsOf(m)
+									if isConvex(mp, c) then
+										local sc = fatnessOf(mp)
+										if sc > bS then bS, bA, bB, bC = sc, ci2, oj, m end
+									end
+								end
+							end
+						end
+					end
+				end
+				if bC then
+					out[bA :: number] = bC
+					out[bB :: number] = nil
+					going = true
+				end
+			end
+			local res: {{number}} = {}
+			for _, q2 in pairs(out) do
+				if q2 then res[#res + 1] = q2 end
+			end
+			return res
+		end
+
+		local repairing = true
+		local guardR = 0
+		while repairing and guardR < 3000 do
+			repairing = false
+			guardR += 1
+			local owner: { [string]: number } = {}
+			for ci, cy in pairs(cyc) do
+				if cy then
+					for i = 1, #cy do owner[cy[i] .. ">" .. cy[(i % #cy) + 1]] = ci end
+				end
+			end
+			for ci, cy in pairs(cyc) do
+				if cy then
+					local vBefore = violation(ptsOf(cy))
+					if vBefore > 0 then
+						local bestJ, bestSet, bestV = nil, nil, vBefore
+						for i = 1, #cy do
+							local u, v = cy[i], cy[(i % #cy) + 1]
+							local oj = owner[v .. ">" .. u]
+							if oj and oj ~= ci and cyc[oj] ~= nil and edgeClass(u, v) == "internal" then
+								local other = cyc[oj] :: {number}
+								local m = mergeCycles(cy, other, edgeClass)
+								if m and #m >= 3 then
+									local worstBefore = math.max(vBefore, violation(ptsOf(other)))
+									local set = nil
+									local mp = ptsOf(m)
+									if isConvex(mp, c) then
+										set = { m }
+									else
+										set = redecompose(m)
+									end
+									if set then
+										local worstAfter = 0
+										local okAll = true
+										for _, q2 in ipairs(set) do
+											local qp = ptsOf(q2)
+											if not isConvex(qp, c) then okAll = false; break end
+											worstAfter = math.max(worstAfter, violation(qp))
+										end
+										if okAll and worstAfter < worstBefore - 1e-9 and worstAfter < bestV then
+											bestV, bestJ, bestSet = worstAfter, oj, set
+										end
+									end
+								end
+							end
+						end
+						if bestSet then
+							local wasRect = cycRect[ci] and cycRect[bestJ :: number]
+							cyc[ci] = bestSet[1]
+							cycRect[ci] = wasRect
+							cyc[bestJ :: number] = nil
+							for k = 2, #bestSet do
+								cyc[#cyc + 1] = bestSet[k]
+								cycRect[#cyc] = false
+							end
+							stats.repaired += 1
+							repairing = true
+							break
+						end
+					end
+				end
 			end
 		end
 
