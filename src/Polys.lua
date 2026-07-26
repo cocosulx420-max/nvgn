@@ -90,6 +90,10 @@ local DEFAULT = {
 	-- the wall beside an obstacle and fanning to a corner 90 studs away.
 	bridgeToEdges = true,
 
+	-- How many of the shortest candidate cuts are re-ranked by the shape they
+	-- leave behind. 1 reduces to pure shortest-cut, which produces needles.
+	cutCandidates = 16,
+
 	-- NEGLIGIBLE-NOTCH DISCARD. The threshold is ABSOLUTE and tiny on purpose.
 	-- Width was removed from the bake because NPCs are not all human-sized and
 	-- sub-agent-width ground stays in the mesh; a discard threshold measured
@@ -99,6 +103,9 @@ local DEFAULT = {
 	discardNotches = true,
 	notchArea = 0.05,    -- studs^2 of the ear being cut off
 	notchDepth = 0.2,    -- studs the boundary is allowed to move inward
+	-- and a cap on the ACCUMULATED loss per region, whichever is smaller
+	notchBudget = 2.0,       -- studs^2
+	notchBudgetFrac = 0.002, -- of the region's own area
 
 	-- Reporting only. Thin polygons are counted, never rejected: narrow ground
 	-- is legitimately narrow, and an absolute limit previously reported 15%
@@ -291,18 +298,28 @@ end
 
 -- NEGLIGIBLE-NOTCH DISCARD, one direction only.
 --
--- `sign` is +1 for an outer ring (CCW) and -1 for a hole ring (CW). A vertex
--- whose ear turns the same way as the ring is CONVEX, and cutting it off makes
--- the walkable area SMALLER -- for a hole ring, "smaller walkable area" means
--- the hole grows, which is the same safe direction. A reflex vertex is the
--- other case, an inward dent, and removing it would ENLARGE the walkable area
--- past a real boundary line. That is refused; it is the one error that walks an
--- agent into a wall.
+-- Rings are stored outer-CCW and holes-CW, and in that convention a LEFT turn
+-- always cuts into the walkable side -- on the outer ring it shaves the region,
+-- on a hole ring it grows the hole. Both shrink walkable area, which is the
+-- safe direction. A right turn is the opposite case: an inward dent whose
+-- removal would ENLARGE the walkable area past a real boundary line. That is
+-- refused; it is the one error that walks an agent into a wall.
+--
+-- This took `sign = -1` for holes at first, which inverted the test for hole
+-- rings and discarded in the FORBIDDEN direction. It was invisible in the
+-- shape numbers and showed up only as an area error of exactly twice the
+-- discarded amount -- area moving the wrong way counts once for being gone and
+-- once for being added. The two-column check is the only thing that saw it.
 --
 -- The ear-empty test doubles as the connectivity guard. If the region pinches
 -- near this corner, some other part of the ring lies inside the ear, the ear is
 -- rejected, and a narrow route can never be sealed off by noise removal.
-local function discardNotches(pts: {V2}, sign: number, c: any): ({V2}, number)
+-- `budget` caps the TOTAL area a single region may give up. Without it the ear
+-- test nibbles: each bite is individually of noise scale, but a long tapering
+-- sliver is a chain of such bites and the whole strip can disappear a fraction
+-- at a time. The cap is what keeps "discard noise, never discard features"
+-- true of the ACCUMULATED effect and not just of each step.
+local function discardNotches(pts: {V2}, c: any, budget: number): ({V2}, number)
 	if not c.discardNotches then return pts, 0 end
 	local ring = pts
 	local dropped = 0
@@ -312,11 +329,11 @@ local function discardNotches(pts: {V2}, sign: number, c: any): ({V2}, number)
 		local n = #ring
 		for i = 1, n do
 			local a, b, d = ring[((i - 2) % n) + 1], ring[i], ring[(i % n) + 1]
-			local turn = cross2(b.x - a.x, b.y - a.y, d.x - b.x, d.y - b.y) * sign
-			if turn > 0 then -- convex for this ring: cutting it under-covers
+			local turn = cross2(b.x - a.x, b.y - a.y, d.x - b.x, d.y - b.y)
+			if turn > 0 then -- left turn: cutting it shrinks walkable area
 				local ear = { a, b, d }
 				local earArea = math.abs(areaOf(ear))
-				if earArea > 0 and earArea <= c.notchArea then
+				if earArea > 0 and earArea <= c.notchArea and dropped + earArea <= budget then
 					-- how far the boundary would actually move
 					local wx, wy = d.x - a.x, d.y - a.y
 					local lw = math.sqrt(wx * wx + wy * wy)
@@ -610,6 +627,26 @@ local function diagonalOk(pts: {V2}, i: number, j: number, c: any): boolean
 		and pointInPoly(pts, (a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
 end
 
+-- The two rings a cut from i to j produces. Both keep the parent's winding.
+local function splitRing(pts: {V2}, i: number, j: number): ({V2}, {V2})
+	local n = #pts
+	local A: {V2} = {}
+	local k = i
+	while true do
+		A[#A + 1] = pts[k]
+		if k == j then break end
+		k = (k % n) + 1
+	end
+	local B: {V2} = {}
+	k = j
+	while true do
+		B[#B + 1] = pts[k]
+		if k == i then break end
+		k = (k % n) + 1
+	end
+	return A, B
+end
+
 local function decompose(ring: {V2}, c: any): {{V2}}
 	local out: {{V2}} = {}
 	local stack: {{V2}} = { ring }
@@ -636,20 +673,40 @@ local function decompose(ring: {V2}, c: any): {{V2}}
 		-- Taking the first anchors every subsequent cut at the same vertex, which
 		-- is what produced fans radiating across open floor.
 		--
-		-- Length is the primary term. An earlier version let a reflex target win
-		-- at any distance, so a 91-stud cut beat a 3-stud one and the fans came
-		-- straight back; clearing two concavities is worth a bounded discount,
-		-- not an unconditional win.
-		local i, best, bestScore = nil, nil, math.huge
+		-- TWO STAGES, because neither criterion works alone. Length shortlists:
+		-- an earlier version let a reflex target win at any distance, so a
+		-- 91-stud cut beat a 3-stud one and the fans came straight back. But
+		-- length alone picks needles -- the shortest cut is often the one that
+		-- shaves a sliver off a corner, and several such cuts converging on one
+		-- vertex is exactly the thin-wedge shape being complained about. So the
+		-- shortlist is ranked by length and the winner is chosen by the SHAPE it
+		-- leaves: maximise the fatness of the WORSE of the two pieces, so a cut
+		-- is only taken if both sides of it are worth having.
+		local cands = {}
 		for _, ri in ipairs(reflex) do
 			for j = 1, n do
 				if j ~= ri and diagonalOk(pts, ri, j, c) then
 					local dx, dy = pts[j].x - pts[ri].x, pts[j].y - pts[ri].y
 					local d2 = dx * dx + dy * dy
-					local score = isReflex(pts, j, c) and d2 * c.reflexBonus or d2
-					if score < bestScore then bestScore = score; i = ri; best = j end
+					cands[#cands + 1] = {
+						i = ri, j = j,
+						score = isReflex(pts, j, c) and d2 * c.reflexBonus or d2,
+					}
 				end
 			end
+		end
+		table.sort(cands, function(x, y)
+			if x.score ~= y.score then return x.score < y.score end
+			if x.i ~= y.i then return x.i < y.i end -- deterministic
+			return x.j < y.j
+		end)
+
+		local i, best, bestQ = nil, nil, -1
+		for t = 1, math.min(#cands, c.cutCandidates) do
+			local cd = cands[t]
+			local A, B = splitRing(pts, cd.i, cd.j)
+			local q = math.min(fatnessOf(A), fatnessOf(B))
+			if q > bestQ then bestQ = q; i = cd.i; best = cd.j end
 		end
 
 		if not i or not best then
@@ -659,21 +716,7 @@ local function decompose(ring: {V2}, c: any): {{V2}}
 			continue
 		end
 
-		local ci, j = i :: number, best :: number
-		local A: {V2} = {}
-		local k = ci
-		while true do
-			A[#A + 1] = pts[k]
-			if k == j then break end
-			k = (k % n) + 1
-		end
-		local B: {V2} = {}
-		k = j
-		while true do
-			B[#B + 1] = pts[k]
-			if k == ci then break end
-			k = (k % n) + 1
-		end
+		local A, B = splitRing(pts, i :: number, best :: number)
 		if #A >= 3 then stack[#stack + 1] = A end
 		if #B >= 3 then stack[#stack + 1] = B end
 	end
@@ -921,11 +964,12 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 		-- notch discard, outer ring inward and hole rings outward
 		local discarded = 0
 		do
+			local budget = math.min(c.notchBudget, regionArea * c.notchBudgetFrac)
 			local d
-			outer, d = discardNotches(outer, 1, c)
+			outer, d = discardNotches(outer, c, budget - discarded)
 			discarded += d
 			for hi, hp in ipairs(holes) do
-				local h2, d2 = discardNotches(hp, -1, c)
+				local h2, d2 = discardNotches(hp, c, budget - discarded)
 				holes[hi] = h2
 				discarded += d2
 			end
