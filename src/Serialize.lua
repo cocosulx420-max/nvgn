@@ -390,51 +390,87 @@ function Serialize.decodeSVO(text: string): any
 	return tree
 end
 
-function Serialize.saveSVO(tree: any, parent: Instance?): StringValue
-	local host = parent or game:GetService("ServerStorage")
-	local sv = host:FindFirstChild("NVGN_SVO")
-	if not sv or not sv:IsA("StringValue") then
-		if sv then sv:Destroy() end
-		sv = Instance.new("StringValue")
-		sv.Name = "NVGN_SVO"
+-- STORAGE. Roblox caps a StringValue at 200,000 characters. The old test
+-- scene's entire artefact was 142 KB, so one value per document was fine; this
+-- map's mesh alone encodes to 2.3 MB and assignment simply throws.
+--
+-- Text over the cap is therefore split across numbered StringValues under a
+-- Folder of the same name and reassembled on load. The split is by raw
+-- character count, not by line, because the decoders parse the reassembled
+-- document rather than the pieces -- so no chunk boundary has to be meaningful.
+--
+-- A document that fits is still written as a plain StringValue, so bakes
+-- produced before this change load unchanged.
+local CHUNK = 190000
+
+local function writeText(host: Instance, name: string, text: string): Instance
+	local existing = host:FindFirstChild(name)
+	if existing then existing:Destroy() end
+	if #text <= CHUNK then
+		local sv = Instance.new("StringValue")
+		sv.Name = name
+		sv.Value = text
 		sv.Parent = host
+		return sv
 	end
-	;(sv :: StringValue).Value = Serialize.encodeSVO(tree)
-	return sv :: StringValue
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	local n = 0
+	for i = 1, #text, CHUNK do
+		n += 1
+		local part = Instance.new("StringValue")
+		part.Name = tostring(n)
+		part.Value = text:sub(i, i + CHUNK - 1)
+		part.Parent = folder
+	end
+	-- the count is authoritative: a missing chunk must be an error, never a
+	-- silently truncated navmesh
+	folder:SetAttribute("Chunks", n)
+	folder.Parent = host
+	return folder
+end
+
+local function readText(host: Instance, name: string): string
+	local node = host:FindFirstChild(name)
+	if not node then
+		error("NVGN.Serialize: no " .. name .. " under " .. host:GetFullName())
+	end
+	if node:IsA("StringValue") then return (node :: StringValue).Value end
+	local n = node:GetAttribute("Chunks")
+	if type(n) ~= "number" then
+		error("NVGN.Serialize: " .. name .. " is a folder with no Chunks attribute")
+	end
+	local parts = table.create(n)
+	for i = 1, n do
+		local sv = node:FindFirstChild(tostring(i))
+		if not sv or not sv:IsA("StringValue") then
+			error(string.format("NVGN.Serialize: %s is missing chunk %d of %d", name, i, n))
+		end
+		parts[i] = (sv :: StringValue).Value
+	end
+	return table.concat(parts)
+end
+
+function Serialize.saveSVO(tree: any, parent: Instance?): Instance
+	local host = parent or game:GetService("ServerStorage")
+	return writeText(host, "NVGN_SVO", Serialize.encodeSVO(tree))
 end
 
 function Serialize.loadSVO(parent: Instance?): any
 	local host = parent or game:GetService("ServerStorage")
-	local sv = host:FindFirstChild("NVGN_SVO")
-	if not sv or not sv:IsA("StringValue") then
-		error("NVGN.Serialize: no NVGN_SVO under " .. host:GetFullName())
-	end
-	return Serialize.decodeSVO((sv :: StringValue).Value)
+	return Serialize.decodeSVO(readText(host, "NVGN_SVO"))
 end
 
 --------------------------------------------------------------------------
 
-function Serialize.save(mesh: any, parent: Instance?): StringValue
+function Serialize.save(mesh: any, parent: Instance?): Instance
 	local host = parent or game:GetService("ServerStorage")
-	local text = Serialize.encode(mesh)
-	local sv = host:FindFirstChild("NVGN_Bake")
-	if not sv or not sv:IsA("StringValue") then
-		if sv then sv:Destroy() end
-		sv = Instance.new("StringValue")
-		sv.Name = "NVGN_Bake"
-		sv.Parent = host
-	end
-	;(sv :: StringValue).Value = text
-	return sv :: StringValue
+	return writeText(host, "NVGN_Bake", Serialize.encode(mesh))
 end
 
 function Serialize.load(parent: Instance?): any
 	local host = parent or game:GetService("ServerStorage")
-	local sv = host:FindFirstChild("NVGN_Bake")
-	if not sv or not sv:IsA("StringValue") then
-		error("NVGN.Serialize: no NVGN_Bake under " .. host:GetFullName())
-	end
-	return Serialize.decode((sv :: StringValue).Value)
+	return Serialize.decode(readText(host, "NVGN_Bake"))
 end
 
 return Serialize
