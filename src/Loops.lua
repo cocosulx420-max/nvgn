@@ -506,4 +506,12 @@ function Loops.visualize(res: any, parent: Instance?)
 	return folder
 end
 
+-- Shared with Polys, which cuts placed rectangles out of a region by feeding
+-- their edges in as extra constraint lines and re-tracing. Deriving the
+-- residual any other way (pixel contours, polygon subtraction) either
+-- staircases it or invites degeneracies; this is the machinery that already
+-- traces every region cleanly. Underscored: internal contract, not API.
+Loops._splitAll = splitAll
+Loops._traceFaces = traceFaces
+
 return Loops
