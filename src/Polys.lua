@@ -61,6 +61,7 @@ export type Poly = {
 	area: number,
 	fatness: number,     -- 16*A/P^2; 1 for a square, -> 0 for a needle
 	kind: string,        -- "claim" (merged from several) | "atom" (never merged)
+	region: number,      -- which Loops region this came from
 }
 export type Config = {
 	weldEps: number?, convexEps: number?, degenerateArea: number?,
@@ -897,7 +898,9 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 	local c = merged(cfg)
 	local t0 = os.clock()
 	local polys: {Poly} = {}
+	local adjacency = {}
 	local stats = {
+		edgeOverOwned = 0,
 		regions = 0, polys = 0, tris = 0, merges = 0,
 		claims = 0, atoms = 0,
 		areaIn = 0, areaOut = 0, areaDiscarded = 0,
@@ -1162,6 +1165,7 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 		end
 
 		local got = 0
+		local faceToPoly: {[number]: number} = {}
 		for fi, f in ipairs(faces) do
 			if dropped[fi] then continue end
 			local pts: {V2} = {}
@@ -1189,11 +1193,44 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 				if kind == "claim" then stats.claims += 1 else stats.atoms += 1 end
 				polys[#polys + 1] = {
 					floor = r.floor, verts = vs, classes = cs, area = a, fatness = fat, kind = kind,
+					region = stats.regions,
 				}
+				faceToPoly[fi] = #polys
 			end
 		end
-		if #faces == atomCount and atomCount > 0 then
-			-- no merge happened at all; worth knowing, not an error
+
+		-- INTRA-REGION ADJACENCY, taken here because it is exact and free.
+		--
+		-- Faces of one region share vertex IDENTITIES, not merely coincident
+		-- coordinates, so two faces are neighbours exactly when they name the
+		-- same edge. Recovering this later from world positions would replace an
+		-- exact test with a tolerance, on the one part of the problem that does
+		-- not need one.
+		do
+			local owner: {[string]: {number}} = {}
+			for fi, f in ipairs(faces) do
+				if faceToPoly[fi] then
+					for k = 1, #f do
+						local key = ekey(f[k], f[(k % #f) + 1])
+						owner[key] = owner[key] or {}
+						table.insert(owner[key], fi)
+					end
+				end
+			end
+			for key, o in pairs(owner) do
+				if #o == 2 and o[1] ~= o[2] then
+					local ia, ib = key:match("^(%d+):(%d+)$")
+					local va, vb = V[tonumber(ia) :: number], V[tonumber(ib) :: number]
+					adjacency[#adjacency + 1] = {
+						a = faceToPoly[o[1]], b = faceToPoly[o[2]],
+						p1 = unproj(va), p2 = unproj(vb),
+						class = classFor(va, vb),
+					}
+				elseif #o > 2 then
+					-- a hole bridge is named by faces on both sides of the slit
+					stats.edgeOverOwned += 1
+				end
+			end
 		end
 		if holesBefore > 0 and #ring == #outer then stats.holesUnbridged += holesBefore end
 
@@ -1220,8 +1257,9 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 	end
 
 	stats.avgFat = stats.polys > 0 and stats.fatSum / stats.polys or 0
+	stats.adjacency = #adjacency
 	stats.seconds = os.clock() - t0
-	return { polys = polys, stats = stats, config = c }
+	return { polys = polys, adjacency = adjacency, stats = stats, config = c }
 end
 
 -- Exposed for diagnosis: a failing region can be replayed from its ring alone.
