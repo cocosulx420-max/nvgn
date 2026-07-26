@@ -181,6 +181,72 @@ The original plan projected the low-headroom frontier down as an edge and split 
 
 Slopes use the angle limit rather than the ±2 deviation, so a long ramp is not merged into flat floor. Small polygons are reserved for genuinely tricky geometry. **The generator has no width concept, so splits are never width-driven** — a narrow corridor already gets its own polygons simply because its two boundary edges are close.
 
+### Polygonization — attempt 5: claim-and-fill (Cocosulx's spec, 2026-07-26)
+
+Four earlier attempts were rejected, all for **shape** rather than for correctness: `58c7220` convex + fatness merge, `108ec1f` trapezoidal sweep (rejected by measurement — 66 polys, 6722 studs of long cuts, 39 slivers), `7c5d694` maximal rectangles + fringe, `d08b26d` explicit width/aspect limits. A fifth, `8bb27f6` oriented maximum-rectangle cover, stalled on frame selection: with one global frame the 200×200 floor's own 800-stud rim outvotes every building in the length-weighted angle histogram, and with multiple frames the differing lattices leave gaps no single frame covers.
+
+This section supersedes those. It is written from Cocosulx's reframing of the goal, which removed the frame problem rather than solving it.
+
+#### What the input actually is
+
+The polygonizer does **not** consume voxels, and none of Recast's contour pipeline applies here. `Clean` produces exact boundary lines stolen from real face planes (deviation from the group plane: median 0.0000, max 0.0020) and `Loops` assembles them into closed, oriented regions with holes, validated at 51556/51556 live cells inside a region and −0.1% area slack. Contour tracing, Douglas–Peucker simplification and ear clipping are all machinery for *recovering* geometry from a staircase, and there is no staircase to recover from. Ear clipping is additionally ruled out by the shape spec: it yields triangle fans where the target is a single trapezoid.
+
+So the problem is narrow and exact: **partition a known-exact simple polygon with holes into few, convex, well-proportioned pieces.**
+
+#### The shape rule, in two tiers
+
+The mesh is not built from one vocabulary of shapes. Two tiers with different jobs:
+
+**Tier 1 — claim the open area.** Cover the uneventful middle of a space with the *largest single convex piece that is still well-proportioned*. Not a tiled grid, and **not rectangle-first**: a rectangle is merely what wins this contest in a boxy room. A splayed alcove is claimed by one trapezoid; a room with a single angled wall by a pentagon. The prior is **few, big, fat, convex** — shape follows the space.
+
+**Tier 2 — fill the remainder exactly.** Everything left over (strips along walls, corners, wedges beside diagonals, the band between a claim and an obstacle) is covered by whatever convex shape genuinely fits. Irregular quads, trapezoids, pentagons. Leftovers are **not** re-decomposed into rectangles, and **not** fanned into triangles: a leftover that is already a clean convex pentagon ships as one pentagon.
+
+Rectangles are therefore a *strategy for the easy majority*, never the vocabulary of the mesh.
+
+#### Where "no invented vertices" applies — and where it does not
+
+The earlier no-Steiner-points rule was being applied too broadly, and that broad reading is what made rectangle placement look self-contradictory (a rect grown into open floor necessarily has corners in the middle of nowhere). The rule is scoped:
+
+- **Tier 1 claims may invent vertices.** A claim is a deliberate placement into empty space. Its corners owe nothing to geometry.
+- **Tier 2 fill may not.** Every fill vertex must land on a real boundary line, a real corner, or the intersection of two real lines. This is where a wrong vertex becomes a wrong navmesh, so the constraint bites exactly where it matters.
+
+Fill pieces are cut only where they are actually concave, using lines the scrap's own edges already lie on — so vertices come from line intersections, the same construction `Loops` and `Clean` closure already use. Building a full line arrangement across a whole floor was considered and rejected: it over-cuts badly (a 3-stud wall stub extended across a 200-stud slab slices the entire floor, reproducing the trapezoidal sweep's long-cut failure). Extension is local to the scrap being fixed.
+
+#### Placement and fill are one problem, not two
+
+The dominant failure mode is a claim placed next to an angled wall leaving a long thin wedge, which then gets chopped into slivers. That is a **placement** defect, not a fill defect. A claim is only well-placed if what it leaves behind is also usable, so claim quality is scored on the claim *and its residue* together — pull the claim back, or angle it, so the leftover is a workable trapezoid rather than a needle.
+
+#### Why the frame problem disappears
+
+Claim orientation is decided by the space a claim sits in, read from the walls bounding that space. There is no floor-wide voted angle, so a big slab's own rim cannot outvote the buildings standing on it, and differing local orientations need no shared lattice because tier 2 fills between them exactly.
+
+#### Negligible-notch discard — accepted in one direction only
+
+Cocosulx offered, explicitly as a suggestion open to refusal, that tiny notches may be ignored for overall quality. Accepted, bounded as follows:
+
+- **Under-covering is allowed.** A polygon may fall short of the true boundary; that pocket is simply not navigable. Same asymmetry already accepted for clearance volumes — rounding toward the safe side is free.
+- **Over-covering is refused.** A polygon may never extend past a boundary line. That is an agent walking into a wall or off a ledge, and it discards the exactness the whole boundary pipeline exists to provide. **Polygons may fall short of the boundary, never past it.**
+- **Connectivity guard.** Nothing is discarded if it is the sole connection between two areas — a 1.5-stud gap can be the only route across the map, and deleting it silently removes a path. A discarded piece must not be a cut vertex of the region's adjacency.
+- **The threshold is absolute and tiny, not agent-relative.** Width was removed from the bake because NPCs are not all human-sized and sub-agent-width ground stays in the mesh; a discard threshold measured against a human reintroduces the width floor through the back door and strands small agents. The threshold is the scale of *authoring noise* — a fraction of a stud, two parts not quite meeting. **Discard noise, never discard features.**
+
+#### Area accounting, from commit #1
+
+The per-region area assertion in studs² is mandatory from the first commit (it has already caught three silent bugs in an hour: centroid-based fans on concave faces, a floating rectangle making the residual multiply-connected, and a one-graph arrangement shattering leftovers into 6497 slivers). With discard, it gains a second column:
+
+```
+polygon area + discarded area == region area      (exact, per region)
+```
+
+Discarded area is **reported per region**, never silently absorbed. 0.3 studs² across a floor is the noise we meant to drop; 40 studs² in one region is a bug, visible immediately to both of us.
+
+#### Quality metric
+
+Polygon thinness is measured **relative to the ground the polygon sits on**, never against an absolute width. An absolute limit previously reported 15% "violations" that were mostly narrow ground being legitimately narrow.
+
+#### Consequence for debug viz
+
+Discarded notches leave polygon edges slightly *inside* `Clean`'s lines in places, so the two will not always coincide. The viz must draw both, or a polygon edge sitting a quarter stud off a wall bar reads as a bug when it is the design.
+
 ## Agents & sizing
 
 Two dimensions decide whether an agent fits: **clearance** (vertical) and **width** (`2 × radius`, horizontal). Only **clearance** is baked — a per-surfel/per-polygon annotation, because vertical headroom can't be recovered from the 2D geometry. **Width is never baked and is not a generation concern at all.** It is resolved entirely at **pathfinding time**, by the pathfinder, using the navmesh (portal shared-edge length, a poly's opposing boundary edges) together with **SVO** solid queries. The generator emits nothing width-related — no field, no annotation, no split.
