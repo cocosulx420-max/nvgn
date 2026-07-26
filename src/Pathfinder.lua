@@ -49,6 +49,11 @@ local DEFAULT = {
 	maxStepDown = 8,     -- dropping is cheap; this is not a fall-damage model
 	stepProbe = 1.0,     -- how far past the edge to look for the other surface
 	stepSample = 4,      -- probe every this many studs ALONG an edge, not once at its midpoint
+
+	-- How closely a smoothed segment must hug the corridor surface. Slack here
+	-- is what lets a shortcut float above the ground it is supposed to follow.
+	corridorSample = 1.0,
+	corridorTol = 1.5,
 }
 
 local function merged(cfg): any
@@ -160,7 +165,17 @@ function Pathfinder.linkSteps(mesh: any, cfg: Config?): number
 					-- what severed an entire upper storey: an 800 stud^2 slab met
 					-- a 3255 stud^2 slab at the same height, over 20 studs of a
 					-- 93-stud edge, and the midpoint landed nowhere near it.
+					-- Record WHERE ALONG THE EDGE each neighbour is actually met, and
+					-- make the portal that stretch only.
+					--
+					-- Using the whole edge instead produced portals up to 121
+					-- studs long, 39 of them over 20 studs. A portal's midpoint is
+					-- a waypoint, so a portal far longer than the real contact
+					-- puts a waypoint out over open air: 52% of paths left the
+					-- navmesh entirely, with unsupported runs up to ~52 studs.
+					-- A portal must be the ground you can actually cross on.
 					local steps = math.max(1, math.ceil(span / c.stepSample))
+					local hits: {[number]: any} = {}
 					for s = 0, steps do
 						local t = (s + 0.5) / (steps + 1)
 						local at = a + (b - a) * t
@@ -169,20 +184,40 @@ function Pathfinder.linkSteps(mesh: any, cfg: Config?): number
 							if j ~= i and containsXZ(q.verts, probe.X, probe.Z) then
 								local dy = heightAt(q.verts, probe.X, probe.Z) - at.Y
 								if dy <= c.maxStepUp and dy >= -c.maxStepDown then
-									local key = (i < j) and (i .. ":" .. j) or (j .. ":" .. i)
-									if not seen[key] then
-										seen[key] = true
-										mesh.portals[#mesh.portals + 1] = {
-											a = i, b = j, p1 = a, p2 = b,
-											length = span, class = "step", kind = "step",
-										}
-										local pi = #mesh.portals
-										table.insert(mesh.neighbours[i], { poly = j, portal = pi, climb = dy })
-										table.insert(mesh.neighbours[j], { poly = i, portal = pi, climb = -dy })
-										added += 1
+									local h = hits[j]
+									if not h then
+										hits[j] = { tmin = t, tmax = t, dySum = dy, n = 1 }
+									else
+										h.tmin = math.min(h.tmin, t)
+										h.tmax = math.max(h.tmax, t)
+										h.dySum += dy
+										h.n += 1
 									end
 								end
 							end
+						end
+					end
+
+					local half = (0.5 / (steps + 1)) -- half a sample spacing, in t
+					for j, h in pairs(hits) do
+						local key = (i < j) and (i .. ":" .. j) or (j .. ":" .. i)
+						if not seen[key] then
+							seen[key] = true
+							-- widen by half a sample either way so a single-sample
+							-- contact is not a zero-length portal
+							local t0 = math.max(0, h.tmin - half)
+							local t1 = math.min(1, h.tmax + half)
+							local p1 = a + (b - a) * t0
+							local p2 = a + (b - a) * t1
+							local dy = h.dySum / h.n
+							mesh.portals[#mesh.portals + 1] = {
+								a = i, b = j, p1 = p1, p2 = p2,
+								length = (p2 - p1).Magnitude, class = "step", kind = "step",
+							}
+							local pi = #mesh.portals
+							table.insert(mesh.neighbours[i], { poly = j, portal = pi, climb = dy })
+							table.insert(mesh.neighbours[j], { poly = i, portal = pi, climb = -dy })
+							added += 1
 						end
 					end
 				end
@@ -381,30 +416,78 @@ local function segmentInCorridor(mesh: any, corridor: {[number]: boolean}, a: Ve
 	return true
 end
 
-function Pathfinder.stringPull(mesh: any, polyPath: {number}, portalPath: {number}, from: Vector3, to: Vector3): {Vector3}
+function Pathfinder.stringPull(mesh: any, polyPath: {number}, portalPath: {number}, from: Vector3, to: Vector3, cfg: Config?): {Vector3}
+	local c = (mesh._pf and mesh._pf.config) or merged(cfg)
 	local corridor: {[number]: boolean} = {}
 	for _, pi in ipairs(polyPath) do corridor[pi] = true end
 
-	-- raw route: the portals themselves, which is always inside the corridor
+	-- Raw route: the portals themselves, which lie on the corridor by
+	-- construction.
+	--
+	-- A STEP PORTAL CONTRIBUTES TWO POINTS, not one. Its midpoint sits on the
+	-- UPPER polygon's edge, and the next waypoint can be most of a floor away,
+	-- so a single point lets the route interpolate the whole height change
+	-- across the next polygon -- the path leaves the ledge and glides diagonally
+	-- through open air until it finally meets the lower floor. Measured, that
+	-- was 55% of raw paths off the mesh with unsupported runs up to 40 studs.
+	-- Pinning the bottom of the step makes the descent happen AT the ledge,
+	-- which is both what it looks like on the ground and what keeps the route
+	-- supported.
 	local raw: {Vector3} = { from }
-	for _, ptIdx in ipairs(portalPath) do
+	local pinned: {[number]: boolean} = {}   -- indices that must not be smoothed across
+	for k, ptIdx in ipairs(portalPath) do
 		local pt = mesh.portals[ptIdx]
-		if pt then raw[#raw + 1] = (pt.p1 + pt.p2) * 0.5 end
+		if pt then
+			local mid = (pt.p1 + pt.p2) * 0.5
+			if pt.kind == "step" then
+				local nextPoly = polyPath[k + 1]
+				local q = nextPoly and mesh.polys[nextPoly]
+				raw[#raw + 1] = mid
+				pinned[#raw] = true
+				if q then
+					-- step just inside the polygon being entered, and drop onto it
+					local cen = mesh._pf.centroids[nextPoly]
+					local dir = Vector3.new(cen.X - mid.X, 0, cen.Z - mid.Z)
+					local landing = mid
+					if dir.Magnitude > 1e-3 then
+						landing = mid + dir.Unit * math.min(c.stepProbe * 1.5, dir.Magnitude * 0.5)
+					end
+					local y = containsXZ(q.verts, landing.X, landing.Z)
+						and heightAt(q.verts, landing.X, landing.Z)
+						or heightAt(q.verts, cen.X, cen.Z)
+					raw[#raw + 1] = Vector3.new(landing.X, y, landing.Z)
+					pinned[#raw] = true
+				end
+			else
+				raw[#raw + 1] = mid
+			end
+		end
 	end
 	raw[#raw + 1] = to
 
 	-- put each raw point on the surface, so the height test below is meaningful
 	for i, p in ipairs(raw) do
-		local pi = Pathfinder.locate(mesh, p)
-		if pi then raw[i] = Vector3.new(p.X, heightAt(mesh.polys[pi].verts, p.X, p.Z), p.Z) end
+		if not pinned[i] then
+			local pi = Pathfinder.locate(mesh, p)
+			if pi then raw[i] = Vector3.new(p.X, heightAt(mesh.polys[pi].verts, p.X, p.Z), p.Z) end
+		end
 	end
 
+	-- Smoothing may never shortcut PAST a pinned point: doing so re-creates the
+	-- diagonal the pinning exists to remove.
 	local out: {Vector3} = { raw[1] }
 	local i = 1
 	while i < #raw do
 		local best = i + 1
 		for j = #raw, i + 2, -1 do
-			if segmentInCorridor(mesh, corridor, raw[i], raw[j], 1.0, 3.0) then best = j; break end
+			local crossesPin = false
+			for k = i + 1, j - 1 do
+				if pinned[k] then crossesPin = true; break end
+			end
+			if not crossesPin and segmentInCorridor(mesh, corridor, raw[i], raw[j], c.corridorSample, c.corridorTol) then
+				best = j
+				break
+			end
 		end
 		out[#out + 1] = raw[best]
 		i = best
