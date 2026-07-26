@@ -33,7 +33,22 @@ if not ok then
 	warn("[NVGN_PathDemo] no bake to load: " .. tostring(mesh))
 	return
 end
-print(string.format("[NVGN_PathDemo] loaded bake: %d polys, %d portals", #mesh.polys, #mesh.portals))
+-- Report what the graph actually looks like on load. A stale Pathfinder module
+-- looks EXACTLY like a broken navmesh from inside the game -- paths fail on
+-- upper floors either way -- and this line is the difference between spotting
+-- that in one second and re-diagnosing the mesh for an hour.
+do
+	local links = (mesh._pf and mesh._pf.stepLinks) or 0
+	local isolated = 0
+	for i = 1, #mesh.polys do
+		if #mesh.neighbours[i] == 0 then isolated += 1 end
+	end
+	print(string.format("[NVGN_PathDemo] bake: %d polys, %d portals, %d step links, %d isolated",
+		#mesh.polys, #mesh.portals, links, isolated))
+	if links == 0 then
+		warn("[NVGN_PathDemo] no step links were built -- stairs will read as cliffs and upper floors will be unreachable")
+	end
+end
 
 local startPart = workspace:FindFirstChild("Start")
 if not startPart or not startPart:IsA("BasePart") then
