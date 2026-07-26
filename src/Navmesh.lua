@@ -72,7 +72,9 @@ function Navmesh.build(cfg: any?)
 	end
 
 	local t = os.clock()
-	local data = LocalGrid.build(cfg)
+	-- the SVO is kept, not discarded: width is resolved at query time against
+	-- solid queries, so the tree is part of what has to reach runtime
+	local data, floorData, tree, parts = LocalGrid.build(cfg)
 	t = mark("localgrid", t)
 
 	local cres = Clean.fromLocal(data, cfg)
@@ -129,9 +131,11 @@ function Navmesh.build(cfg: any?)
 		neighbours = ptres.neighbours,
 		volumes = vres.volumes,
 		volumeIndex = vidx,
+		svo = tree,
 		stats = stats,
 		-- stage results kept for debugging and for the viz helpers
-		stages = { data = data, clean = cres, loops = lres, polys = pres, portals = ptres, volumes = vres },
+		stages = { data = data, floor = floorData, parts = parts, svo = tree,
+			clean = cres, loops = lres, polys = pres, portals = ptres, volumes = vres },
 	}
 end
 

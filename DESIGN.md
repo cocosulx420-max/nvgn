@@ -287,7 +287,21 @@ Line-based versioned text, one record per line, stored as a `StringValue` (`Serv
 
 Test scene: 58.5 KB, encode 0.003s, decode 0.002s, all counts and area match, and the portal graph rebuilt from the bake alone reproduces the live build exactly (6 components, largest 69, 44 isolated). Neighbour lists are derived on load rather than stored.
 
-**Not yet in the bake:** the SVO, which must persist to runtime because width is resolved there against solid queries.
+#### The SVO in the bake
+
+The octree reaches runtime too, in its own `StringValue` (`ServerStorage.NVGN_SVO`) — separate because it is an order of magnitude larger and a consumer that only wants polygons and portals should not have to parse it. It has to be there at all because **width is deliberately not baked**: it is resolved per agent at query time from portal edge lengths together with solid queries against this tree.
+
+Encoding is a preorder walk storing **structure only**, because there is nothing else to store — a node is solid or subdivided, and the tree already prunes empty children and collapses eight solid octants into their parent, so what is written is exactly the compressed tree:
+
+```
+'.'        solid; do not descend
+two hex    subdivided; 8-bit mask of which octants are present, which follow
+'-'        empty; only reachable at the root
+```
+
+A solid subtree therefore costs **one character however large it is**, which is the point of the octree being compressed in the first place. **No coordinates are written at all** — every node's cube is implied by its path from the root, so position cannot drift on reload, by construction.
+
+Test scene: 83.5 KB for 51429 solid leaves and 16647 internal nodes, encode 0.019s, decode 0.027s, load from store 0.011s. Verified three ways, not one: structure counts match exactly and the body is fully consumed; the **solid leaf sets are identical** (51429 each, zero on either side only); and `isSolid` agrees on 257145 probes placed at every leaf centre plus four jittered probes per leaf straddling faces and corners — **0 mismatches**, with 216677 of those probes reporting solid.
 
 ## Agents & sizing
 
