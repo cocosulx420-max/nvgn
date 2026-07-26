@@ -506,10 +506,4 @@ function Loops.visualize(res: any, parent: Instance?)
 	return folder
 end
 
--- Shared with Polys, whose fringe phase subdivides individual lattice cells
--- with exactly this machinery rather than reimplementing it. Underscored:
--- internal contract, not API.
-Loops._splitAll = splitAll
-Loops._traceFaces = traceFaces
-
 return Loops
