@@ -94,6 +94,13 @@ local DEFAULT = {
 	-- leave behind. 1 reduces to pure shortest-cut, which produces needles.
 	cutCandidates = 16,
 
+	-- Noise-width strips. 0.75 is half the crawl clearance, so nothing of any
+	-- size fits; raising this toward agent widths would reintroduce the width
+	-- floor the bake deliberately does not have.
+	discardStrips = true,
+	minStripWidth = 0.75,
+	stripBudgetFrac = 0.02, -- of the region's own area
+
 	-- NEGLIGIBLE-NOTCH DISCARD. The threshold is ABSOLUTE and tiny on purpose.
 	-- Width was removed from the bake because NPCs are not all human-sized and
 	-- sub-agent-width ground stays in the mesh; a discard threshold measured
@@ -897,6 +904,7 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 		maxVerts = 0, nonConvex = 0, thin = 0,
 		badRegions = 0, worstAreaErr = 0, worstFloor = "",
 		holes = 0, holesUnbridged = 0, facesDropped = 0,
+		strips = 0, stripArea = 0,
 		fatSum = 0, worstFat = 1, worstFatFloor = "",
 	}
 
@@ -1048,8 +1056,114 @@ function Polys.fromLoops(lres: any, cfg: Config?)
 		local atomCount = #faces
 		stats.merges += mergeConvex(faces, V, boundary, c)
 
+		----------------------------------------------------------------
+		-- NOISE-WIDTH STRIP DISCARD (Cocosulx's call, after review).
+		--
+		-- Some polygons are thin because the GROUND is thin, not because the
+		-- decomposition chose badly -- searching every candidate cut leaves the
+		-- worst case identical, so these are forced by the region outline. The
+		-- widest of them is 0.75 studs, which is half the crawl clearance: no
+		-- agent of any size fits, and the ground exists only because a wall was
+		-- authored a fraction of a stud off the floor's rim. That is the same
+		-- noise scale Clean's coplanarEps already merges away for lines.
+		--
+		-- This is a width test, which the bake otherwise has none of, so it is
+		-- fenced in hard. It only ever removes area (under-covering, the safe
+		-- direction), and it refuses three ways:
+		--
+		--   SEAM      a seam is a portal. Every ClipRamp entry on the test scene
+		--             is carried by a strip 0.58 studs wide; discarding those
+		--             deletes the ramp entrances outright. Checked before
+		--             writing this, and it is why the guard exists.
+		--   CONTINUATION  the handover to an overlapping floor. Deleting one
+		--             severs a link this region cannot even see.
+		--   CONNECTIVITY  the strip must not be the only thing joining two parts
+		--             of its region, re-tested after each removal so several
+		--             discards cannot jointly disconnect what none does alone.
+		----------------------------------------------------------------
+		local dropped: {[number]: boolean} = {}
+		if c.discardStrips then
+			local function faceEdgeKeys(f: {number}): {string}
+				local ks = {}
+				for k = 1, #f do ks[#ks + 1] = ekey(f[k], f[(k % #f) + 1]) end
+				return ks
+			end
+			local function connectedWithout(skip: number): boolean
+				local owner: {[string]: {number}} = {}
+				local live = {}
+				for i, f in ipairs(faces) do
+					if not dropped[i] and i ~= skip then
+						live[#live + 1] = i
+						for _, k in ipairs(faceEdgeKeys(f)) do
+							owner[k] = owner[k] or {}
+							table.insert(owner[k], i)
+						end
+					end
+				end
+				if #live <= 1 then return true end
+				local adj: {[number]: {number}} = {}
+				for _, o in pairs(owner) do
+					if #o == 2 then
+						adj[o[1]] = adj[o[1]] or {}; table.insert(adj[o[1]], o[2])
+						adj[o[2]] = adj[o[2]] or {}; table.insert(adj[o[2]], o[1])
+					end
+				end
+				local seenF: {[number]: boolean} = { [live[1]] = true }
+				local queue, head, reached = { live[1] }, 1, 1
+				while head <= #queue do
+					local cur = queue[head]; head += 1
+					for _, nb in ipairs(adj[cur] or {}) do
+						if not seenF[nb] then
+							seenF[nb] = true; reached += 1; queue[#queue + 1] = nb
+						end
+					end
+				end
+				return reached == #live
+			end
+
+			-- worst-shaped first, so the budget goes to the pieces that matter
+			local order = {}
+			for i, f in ipairs(faces) do
+				local pts: {V2} = {}
+				for k, v in ipairs(f) do pts[k] = V[v] end
+				local longest = 0
+				for k = 1, #pts do
+					local q = pts[(k % #pts) + 1]
+					local dx, dy = q.x - pts[k].x, q.y - pts[k].y
+					longest = math.max(longest, math.sqrt(dx * dx + dy * dy))
+				end
+				local a = math.abs(areaOf(pts))
+				if longest > 1e-6 and a / longest < c.minStripWidth then
+					order[#order + 1] = { i = i, pts = pts, area = a, w = a / longest }
+				end
+			end
+			table.sort(order, function(x, y)
+				if x.w ~= y.w then return x.w < y.w end
+				return x.i < y.i -- deterministic
+			end)
+
+			local budget = regionArea * c.stripBudgetFrac
+			local used = 0
+			for _, cd in ipairs(order) do
+				local blocked = false
+				for k = 1, #cd.pts do
+					local cls = classFor(cd.pts[k], cd.pts[(k % #cd.pts) + 1])
+					if cls == "seam" or cls == "continuation" then blocked = true; break end
+				end
+				if not blocked and used + cd.area <= budget and connectedWithout(cd.i) then
+					dropped[cd.i] = true
+					used += cd.area
+					discarded += cd.area
+					stats.strips += 1
+					stats.stripArea += cd.area
+				end
+			end
+			stats.areaDiscarded += used
+		end
+
 		local got = 0
-		for _, f in ipairs(faces) do
+		for fi, f in ipairs(faces) do
+			if dropped[fi] then continue end
 			local pts: {V2} = {}
 			for i, v in ipairs(f) do pts[i] = V[v] end
 			local a = math.abs(areaOf(pts))

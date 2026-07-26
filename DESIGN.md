@@ -229,6 +229,24 @@ Cocosulx offered, explicitly as a suggestion open to refusal, that tiny notches 
 - **Connectivity guard.** Nothing is discarded if it is the sole connection between two areas — a 1.5-stud gap can be the only route across the map, and deleting it silently removes a path. A discarded piece must not be a cut vertex of the region's adjacency.
 - **The threshold is absolute and tiny, not agent-relative.** Width was removed from the bake because NPCs are not all human-sized and sub-agent-width ground stays in the mesh; a discard threshold measured against a human reintroduces the width floor through the back door and strands small agents. The threshold is the scale of *authoring noise* — a fraction of a stud, two parts not quite meeting. **Discard noise, never discard features.**
 
+#### Noise-width strip discard — the one width test in the bake
+
+**DECISION (Cocosulx, 2026-07-26, after reviewing the first working output).** Some polygons come out thin because the *ground* is thin, not because the decomposition chose badly. This was established by measurement rather than assumed: re-ranking cuts by the shape they leave improves the average (fatness 0.615 → 0.626) but searching **every** candidate cut in a region leaves the worst case at exactly the same 0.0203, so those wedges are forced by the region outline and no cut placement can fix them.
+
+Such strips measured 0.55–1.0 studs wide. Nothing fits — crawl clearance alone is 1.5 — and they exist because a wall was authored a fraction of a stud off the floor's rim, the same noise scale `Clean`'s `coplanarEps` (0.5) already merges away for lines. So strips narrower than **0.75 studs** are dropped.
+
+This is a width test, and the bake deliberately has no other, so it is fenced in hard:
+
+- **Under-covering only.** It removes area, never adds it.
+- **Never a seam.** A seam is a portal. Every ClipRamp entry on the test scene is carried by a strip 0.58 studs wide, and discarding those deletes the ramp entrances outright. This was checked *before* the rule was written and is the reason the guard exists. Verified by measurement: total seam length is 615.0 studs with the discard on and off.
+- **Never a continuation.** That is the handover to an overlapping floor — deleting one severs a link the region cannot see.
+- **Never a cut vertex.** A strip must not be the only thing joining two parts of its region, re-tested after each removal so several discards cannot jointly disconnect what none does alone.
+- **Budgeted** at 2% of the region's own area, and reported.
+
+**0.75 is a ceiling, not a starting point.** Raising it toward agent widths reintroduces the width floor the bake exists without, and strands the small agents that motivated removing width in the first place.
+
+Test scene: 2 strips, 82.3 studs² (0.16% of the map), worst fatness 0.0203 → 0.0519, all ramp entries intact.
+
 #### Area accounting, from commit #1
 
 The per-region area assertion in studs² is mandatory from the first commit (it has already caught three silent bugs in an hour: centroid-based fans on concave faces, a floating rectangle making the residual multiply-connected, and a one-graph arrangement shattering leftovers into 6497 slivers). With discard, it gains a second column:
