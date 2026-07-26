@@ -94,6 +94,68 @@ local function heightAt(verts: {Vector3}, x: number, z: number): number
 	return a.Y - (n.X * (x - a.X) + n.Z * (z - a.Z)) / n.Y
 end
 
+--------------------------------------------------------------------------
+-- XZ broadphase over polygons.
+--
+-- `linkSteps` and `locate` both asked "which polygon is under this point?" by
+-- scanning every polygon. At 160 polys that is free. At 5,623 it is not:
+-- linkSteps probes several samples along every wall and dropoff edge in the
+-- mesh, so the scan is entered tens of thousands of times and the stage went
+-- from imperceptible to 136 seconds -- paid again on every `prepare`, i.e. on
+-- every Play.
+--
+-- A polygon is registered in every cell its XZ bounding box covers, so the
+-- single cell containing a query point holds every polygon that could possibly
+-- contain it. That makes the point query EXACT -- there is no neighbour scan to
+-- get wrong, because AABB containment is a necessary condition for polygon
+-- containment.
+local POLY_CELL = 8
+
+local function polyIndex(polys: {any}, cell: number): any
+	local idx: { [string]: {number} } = {}
+	for i, p in ipairs(polys) do
+		local minx, minz = math.huge, math.huge
+		local maxx, maxz = -math.huge, -math.huge
+		for _, v in ipairs(p.verts) do
+			if v.X < minx then minx = v.X end
+			if v.X > maxx then maxx = v.X end
+			if v.Z < minz then minz = v.Z end
+			if v.Z > maxz then maxz = v.Z end
+		end
+		for cx = math.floor(minx / cell), math.floor(maxx / cell) do
+			for cz = math.floor(minz / cell), math.floor(maxz / cell) do
+				local k = cx .. ":" .. cz
+				local b = idx[k]
+				if not b then b = {}; idx[k] = b end
+				b[#b + 1] = i
+			end
+		end
+	end
+	return idx
+end
+
+local function polysAt(idx: any, x: number, z: number, cell: number): {number}
+	return idx[math.floor(x / cell) .. ":" .. math.floor(z / cell)] or {}
+end
+
+-- Every polygon whose bounding box lies within `radius` of the point, for the
+-- off-mesh nearest-edge fallback.
+local function polysNear(idx: any, x: number, z: number, cell: number, radius: number): {number}
+	local out: {number} = {}
+	local seen: { [number]: boolean } = {}
+	for cx = math.floor((x - radius) / cell), math.floor((x + radius) / cell) do
+		for cz = math.floor((z - radius) / cell), math.floor((z + radius) / cell) do
+			local b = idx[cx .. ":" .. cz]
+			if b then
+				for _, i in ipairs(b) do
+					if not seen[i] then seen[i] = true; out[#out + 1] = i end
+				end
+			end
+		end
+	end
+	return out
+end
+
 local function centroidOf(verts: {Vector3}): Vector3
 	local s = Vector3.zero
 	for _, v in ipairs(verts) do s += v end
@@ -149,6 +211,7 @@ function Pathfinder.linkSteps(mesh: any, cfg: Config?): number
 	local c = (mesh._pf and mesh._pf.config) or merged(cfg)
 	local added = 0
 	local seen: {[string]: boolean} = {}
+	local idx = (mesh._pf and mesh._pf.polyIndex) or polyIndex(mesh.polys, POLY_CELL)
 
 	for i, p in ipairs(mesh.polys) do
 		for k = 1, #p.verts do
@@ -180,7 +243,8 @@ function Pathfinder.linkSteps(mesh: any, cfg: Config?): number
 						local t = (s + 0.5) / (steps + 1)
 						local at = a + (b - a) * t
 						local probe = at + n * c.stepProbe
-						for j, q in ipairs(mesh.polys) do
+						for _, j in ipairs(polysAt(idx, probe.X, probe.Z, POLY_CELL)) do
+							local q = mesh.polys[j]
 							if j ~= i and containsXZ(q.verts, probe.X, probe.Z) then
 								local dy = heightAt(q.verts, probe.X, probe.Z) - at.Y
 								if dy <= c.maxStepUp and dy >= -c.maxStepDown then
@@ -260,15 +324,19 @@ function Pathfinder.prepare(mesh: any, cfg: Config?): any
 	local centroids = {}
 	for i, p in ipairs(mesh.polys) do centroids[i] = centroidOf(p.verts) end
 	stripStepLinks(mesh)
-	mesh._pf = { centroids = centroids, config = c }
+	-- built once here rather than per call: linkSteps below hits it tens of
+	-- thousands of times, and `locate` runs every frame the demo re-paths
+	mesh._pf = { centroids = centroids, config = c, polyIndex = polyIndex(mesh.polys, POLY_CELL) }
 	mesh._pf.stepLinks = c.linkSteps and Pathfinder.linkSteps(mesh, c) or 0
 	return mesh
 end
 
 function Pathfinder.locate(mesh: any, pos: Vector3, cfg: Config?): number?
 	local c = (mesh._pf and mesh._pf.config) or merged(cfg)
+	local idx = (mesh._pf and mesh._pf.polyIndex) or polyIndex(mesh.polys, POLY_CELL)
 	local best, bestScore = nil, math.huge
-	for i, p in ipairs(mesh.polys) do
+	for _, i in ipairs(polysAt(idx, pos.X, pos.Z, POLY_CELL)) do
+		local p = mesh.polys[i]
 		if not (c.minClearance and p.minClearance and p.minClearance < c.minClearance) then
 			if containsXZ(p.verts, pos.X, pos.Z) then
 				local y = heightAt(p.verts, pos.X, pos.Z)
@@ -287,7 +355,8 @@ function Pathfinder.locate(mesh: any, pos: Vector3, cfg: Config?): number?
 	-- off-mesh: snap to the nearest polygon edge within the search radius, so
 	-- standing on a discarded strip or a hair outside a boundary still works
 	local nearest, nd = nil, c.searchRadius
-	for i, p in ipairs(mesh.polys) do
+	for _, i in ipairs(polysNear(idx, pos.X, pos.Z, POLY_CELL, c.searchRadius)) do
+		local p = mesh.polys[i]
 		if not (c.minClearance and p.minClearance and p.minClearance < c.minClearance) then
 			for k = 1, #p.verts do
 				local d = distToSegment(pos.X, pos.Z, p.verts[k], p.verts[(k % #p.verts) + 1])

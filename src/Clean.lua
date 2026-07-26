@@ -725,6 +725,71 @@ local function closestApproach(X1: Vector3, D1: Vector3, X2: Vector3, D2: Vector
 	return t1, (p1 - p2).Magnitude
 end
 
+-- Spatial buckets over edge SEGMENTS, for the cross-floor closure below.
+--
+-- `closeAcrossFloors` used to test every open endpoint against every edge on a
+-- different floor. That is ~375k cheap operations at 433 edges and invisible;
+-- at the 22k edges a multi-storey map produces it is ~1e9 and the stage stops
+-- finishing.
+--
+-- The search was never actually global. A candidate only survives if the point
+-- it produces lies within `allow` (at most maxTrim) of the endpoint AND within
+-- maxExtendStrong of the partner's own extent, with the two lines passing
+-- within seamEps of one another. So a partner that can possibly win must have
+-- its SEGMENT come within maxTrim + maxExtendStrong + seamEps of the endpoint.
+-- Bucketing by that radius changes no result -- it only stops asking edges that
+-- are provably out of range.
+--
+-- Sizing is load-bearing: cells are 2*reach and segments are sampled every
+-- cell/2 studs, so any point a segment passes near is at most one cell index
+-- away from one of that segment's samples. That is what makes the 3x3x3 query
+-- exhaustive rather than merely likely.
+local function edgeReach(c: any): number
+	return c.maxTrim + c.maxExtendStrong + c.seamEps
+end
+
+local function bucketEdges(edges: {Edge}, cell: number): any
+	local buckets: { [string]: {Edge} } = {}
+	local spacing = cell * 0.5
+	for _, e in ipairs(edges) do
+		local d = e.b - e.a
+		local steps = math.max(1, math.ceil(d.Magnitude / spacing))
+		local seen: { [string]: boolean } = {}
+		for i = 0, steps do
+			local p = e.a + d * (i / steps)
+			local k = string.format("%d:%d:%d", math.floor(p.X / cell),
+				math.floor(p.Y / cell), math.floor(p.Z / cell))
+			if not seen[k] then
+				seen[k] = true
+				local b = buckets[k]
+				if not b then b = {}; buckets[k] = b end
+				b[#b + 1] = e
+			end
+		end
+	end
+	return buckets
+end
+
+local function nearbyEdges(buckets: any, p: Vector3, cell: number, out: {Edge}, seen: any)
+	table.clear(out)
+	table.clear(seen)
+	local bx = math.floor(p.X / cell)
+	local by = math.floor(p.Y / cell)
+	local bz = math.floor(p.Z / cell)
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			for dz = -1, 1 do
+				local b = buckets[string.format("%d:%d:%d", bx + dx, by + dy, bz + dz)]
+				if b then
+					for _, e in ipairs(b) do
+						if not seen[e] then seen[e] = true; out[#out + 1] = e end
+					end
+				end
+			end
+		end
+	end
+end
+
 -- Cross-floor closure. Per-floor closure cannot fix an edge that ends where a
 -- NEIGHBOURING part takes over — its partner line lives in another floor's set
 -- — which is most of the remaining open ends. Two lines on different floors
@@ -732,6 +797,10 @@ end
 -- gap be within seamEps: still a computed point on the edge's own line, never a
 -- weld that drags geometry toward a measured endpoint.
 local function closeAcrossFloors(edges: {Edge}, c: any, report: any)
+	local cell = 2 * edgeReach(c) + 1
+	local buckets = bucketEdges(edges, cell)
+	local cand: {Edge} = {}
+	local seen: any = {}
 	for _, e in ipairs(edges) do
 		for _, which in ipairs({ "a", "b" }) do
 			local closedKey = (which == "a") and "closedA" or "closedB"
@@ -741,7 +810,8 @@ local function closeAcrossFloors(edges: {Edge}, c: any, report: any)
 				-- moving below it extends, and moving above it trims
 				local tOther = (((which == "a") and e.b or e.a) - e.X0):Dot(e.D)
 				local bestT, bestGap = nil, c.seamEps
-				for _, o in ipairs(edges) do
+				nearbyEdges(buckets, (e :: any)[which] :: Vector3, cell, cand, seen)
+				for _, o in ipairs(cand) do
 					if o.floor ~= e.floor then
 						local t, gap = closestApproach(e.X0, e.D, o.X0, o.D)
 						-- NB: written as explicit branches on purpose. The
@@ -811,11 +881,38 @@ local function bridgeDeferred(edges: {Edge}, data: any, c: any, report: any): {E
 		b[#b + 1] = e
 	end
 
+	-- Same story as the cross-floor closure: the linear form rescanned every
+	-- cell of every fallback grid per probe. Two fallback floors made that
+	-- free; the 468 this map has do not. Bucket radius equals the 1.5 test
+	-- radius, so a 3x3x3 query is exhaustive and the answer is unchanged.
+	local FB = 1.5
+	local fbCells: { [string]: {Vector3} } = {}
+	for _, g in pairs(data.grids) do
+		if g.fallback then
+			for _, cell in ipairs(g.cells) do
+				local p = cell.pos
+				local k = string.format("%d:%d:%d", math.floor(p.X / FB),
+					math.floor(p.Y / FB), math.floor(p.Z / FB))
+				local b = fbCells[k]
+				if not b then b = {}; fbCells[k] = b end
+				b[#b + 1] = p
+			end
+		end
+	end
+
 	local function deferredFloorAt(p: Vector3): boolean
-		for _, g in pairs(data.grids) do
-			if g.fallback then
-				for _, cell in ipairs(g.cells) do
-					if (cell.pos - p).Magnitude < 1.5 then return true end
+		local bx = math.floor(p.X / FB)
+		local by = math.floor(p.Y / FB)
+		local bz = math.floor(p.Z / FB)
+		for dx = -1, 1 do
+			for dy = -1, 1 do
+				for dz = -1, 1 do
+					local b = fbCells[string.format("%d:%d:%d", bx + dx, by + dy, bz + dz)]
+					if b then
+						for _, q in ipairs(b) do
+							if (q - p).Magnitude < 1.5 then return true end
+						end
+					end
 				end
 			end
 		end
