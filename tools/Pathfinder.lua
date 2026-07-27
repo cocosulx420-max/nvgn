@@ -42,18 +42,13 @@ local DEFAULT = {
 	searchRadius = 12,
 	minClearance = nil,
 
-	-- AGENT BODY. Width 4, height 5, thickness 1: it stands 5 studs tall and
-	-- needs 4 studs of lateral room, so its radius is 2. Width is resolved here
-	-- and not in the bake, by an explicit earlier decision -- the generator emits
-	-- nothing width-related, because an agent of any size must be servable
-	-- without re-baking.
-	--
-	-- The binding horizontal dimension is the LARGER of width and thickness. A
-	-- character turns to face where it is going, so the 4-stud width sweeps the
-	-- corridor; assuming it could squeeze through on its 1-stud edge would be
-	-- betting the route on an orientation nothing guarantees.
+	-- AGENT BODY. A Roblox character's real collidable hitbox is 2 studs wide
+	-- and 5 tall, so the radius is 1. Width is resolved here and not in the
+	-- bake, by an explicit earlier decision -- the generator emits nothing
+	-- width-related, because an agent of any size must be servable without
+	-- re-baking.
 	agentHeight = 5,
-	agentRadius = 2,
+	agentRadius = 1,
 	-- refuse to smooth a corner so tight the body would clip the geometry
 	validateSolid = true,
 
@@ -96,7 +91,11 @@ local DEFAULT = {
 	-- How closely a smoothed segment must hug the corridor surface. Slack here
 	-- is what lets a shortcut float above the ground it is supposed to follow.
 	corridorSample = 1.0,
-	corridorTol = 1.5,
+	corridorTol = 1.5,        -- how far a shortcut may float ABOVE the surface
+	-- ...and how far it may sink BELOW it, which is a different question: below
+	-- the surface is inside the ground. Only enough for float noise and the
+	-- sub-stud lips authored geometry is full of.
+	corridorBelowTol = 0.2,
 	-- height change below which a step link is just a lip, not a step worth
 	-- pinning two waypoints for
 	stepPinMin = 0.75,
@@ -532,7 +531,7 @@ end
 -- corridor. Reachability is decided by sampling, which is approximate -- but it
 -- is approximate in a way that can only make the path more conservative, and it
 -- has no handedness at all to get wrong.
-local function segmentInCorridor(mesh: any, corridor: {[number]: boolean}, a: Vector3, b: Vector3, step: number, tol: number): boolean
+local function segmentInCorridor(mesh: any, corridor: {[number]: boolean}, a: Vector3, b: Vector3, step: number, tol: number, belowTol: number): boolean
 	local d = b - a
 	local len = d.Magnitude
 	local n = math.max(1, math.ceil(len / step))
@@ -543,10 +542,18 @@ local function segmentInCorridor(mesh: any, corridor: {[number]: boolean}, a: Ve
 			local poly = mesh.polys[pi]
 			if containsXZ(poly.verts, p.X, p.Z) then
 				local y = heightAt(poly.verts, p.X, p.Z)
-				-- the sample must be on THIS corridor's surface, not merely above
+				-- The sample must be on THIS corridor's surface, not merely above
 				-- some polygon: without the height test a shortcut may sail over
-				-- a courtyard and land on the far side
-				if math.abs(p.Y - y) <= tol then ok = true; break end
+				-- a courtyard and land on the far side.
+				--
+				-- ASYMMETRIC, and this is the whole point. Floating a little ABOVE
+				-- the surface is a rounded corner and costs nothing. Sinking BELOW
+				-- it is walking through the ground. A symmetric +/-1.5 let a
+				-- shortcut dip 1.5 studs under the surface, which on a staircase
+				-- is exactly a straight line cutting through the risers -- the
+				-- path visibly passing through a step.
+				local dy = p.Y - y
+				if dy <= tol and dy >= -belowTol then ok = true; break end
 			end
 		end
 		if not ok then return false end
@@ -557,7 +564,7 @@ end
 -- Does the AGENT'S BODY fit along this shortcut?
 --
 -- Corridor containment alone only asks whether the LINE stays over walkable
--- polygons. A 4-stud-wide body cutting a corner clips the wall long before its
+-- polygons. A body cutting a corner clips the wall long before its
 -- centre line leaves the corridor, and where the mesh still covers a little
 -- solid, containment is satisfied by a polygon that should not be there.
 --
@@ -683,7 +690,7 @@ function Pathfinder.stringPull(mesh: any, polyPath: {number}, portalPath: {numbe
 				if pinned[k] then crossesPin = true; break end
 			end
 			if not crossesPin
-				and segmentInCorridor(mesh, corridor, raw[i], raw[j], c.corridorSample, c.corridorTol)
+				and segmentInCorridor(mesh, corridor, raw[i], raw[j], c.corridorSample, c.corridorTol, c.corridorBelowTol)
 				and bodyFits(mesh, raw[i], raw[j], c) then
 				best = j
 				break
