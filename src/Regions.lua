@@ -371,7 +371,7 @@ function Regions.fromLocal(data: any, cfg: Config?)
 						return w:Dot(g.u), w:Dot(g.v)
 					end
 
-					local outer, holeRings = nil, {}
+					local outer, holeRings, allRings = nil, {}, {}
 					for _, loop in ipairs(loops) do
 						-- group consecutive segments sharing a plane (nil planeId
 						-- never groups: those stay per-segment lattice steps)
@@ -441,12 +441,21 @@ function Regions.fromLocal(data: any, cfg: Config?)
 							local x2, y2 = toUV(verts[(i % #verts) + 1])
 							a2 += x1 * y2 - x2 * y1
 						end
-						local ring = { verts = verts, classes = classes, sources = sources, area = a2 * 0.5 }
-						if a2 >= 0 then
-							if not outer or math.abs(a2) > math.abs(outer.area * 2) then outer = ring end
-						else
-							holeRings[#holeRings + 1] = ring
-						end
+						-- Do NOT decide outer-vs-hole by the SIGN of the area. The (u,v)
+						-- frame's handedness varies between parts, so a correct outer
+						-- ring can come out negative and the whole component is then
+						-- silently dropped. This project has already been bitten once
+						-- by a handedness assumption selecting the unbounded face.
+						-- Magnitude is orientation-free: the outer ring is the biggest.
+						allRings[#allRings + 1] =
+							{ verts = verts, classes = classes, sources = sources, area = a2 * 0.5 }
+					end
+
+					for _, ring in ipairs(allRings) do
+						if not outer or math.abs(ring.area) > math.abs(outer.area) then outer = ring end
+					end
+					for _, ring in ipairs(allRings) do
+						if ring ~= outer then holeRings[#holeRings + 1] = ring end
 					end
 
 					if outer and #outer.verts >= 3 then
