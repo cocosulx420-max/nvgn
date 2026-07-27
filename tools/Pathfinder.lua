@@ -42,24 +42,74 @@ local DEFAULT = {
 	searchRadius = 12,
 	minClearance = nil,
 
+	-- AGENT BODY. Width 4, height 5, thickness 1: it stands 5 studs tall and
+	-- needs 4 studs of lateral room, so its radius is 2. Width is resolved here
+	-- and not in the bake, by an explicit earlier decision -- the generator emits
+	-- nothing width-related, because an agent of any size must be servable
+	-- without re-baking.
+	--
+	-- The binding horizontal dimension is the LARGER of width and thickness. A
+	-- character turns to face where it is going, so the 4-stud width sweeps the
+	-- corridor; assuming it could squeeze through on its 1-stud edge would be
+	-- betting the route on an orientation nothing guarantees.
+	agentHeight = 5,
+	agentRadius = 2,
+	-- refuse to smooth a corner so tight the body would clip the geometry
+	validateSolid = true,
+
+	-- WHERE THE BODY IS ACTUALLY ENFORCED, and why not in the graph.
+	--
+	-- Both obvious graph filters are proxies, and both are wrong here:
+	--
+	--   Per-polygon `minClearance` is the MINIMUM over the whole polygon, so a
+	--   floor with one low spot under a stairwell is excluded entirely. That is
+	--   the atomicity problem the clearance design already flags -- the scalar is
+	--   a conservative PRE-FILTER, not a verdict. Enforced per polygon it cut
+	--   routing from 11% to 2%, excluding 1,302 polygons of 6,747.
+	--
+	--   Portal LENGTH is a doorway width only at a real constriction. Most
+	--   portals here are internal cuts between two pieces of the same open
+	--   floor, where the shared edge is short but the agent walks across freely.
+	--   Step portals average 3.8 studs for that reason, so a 4-stud body was
+	--   refused ground it can plainly walk: routing 11% -> 3%.
+	--
+	-- So the body is enforced where the agent actually goes -- swept along the
+	-- smoothed route by `bodyFits`, at its true 4x5 size, against real collision
+	-- geometry. That is exact rather than a proxy, and it cannot over-exclude a
+	-- polygon for a low spot the route never visits.
+	enforcePolyClearance = false,
+	enforcePortalWidth = false,
+
 	-- Agent mobility. These belong to the AGENT, not to the bake, which is why
 	-- they live here as query parameters and not as baked flags.
 	linkSteps = true,
 	maxStepUp = 2.2,     -- a Roblox humanoid auto-steps 2; a little slack for authored lips
 	maxStepDown = 8,     -- dropping is cheap; this is not a fall-damage model
 	stepProbe = 1.0,     -- how far past the edge to look for the other surface
-	stepSample = 4,      -- probe every this many studs ALONG an edge, not once at its midpoint
+	-- Probe every this many studs ALONG an edge, not once at its midpoint. This
+	-- also sets how accurately a step portal's LENGTH is measured, and that
+	-- length is what the width filter judges: at a 4-stud pitch a genuinely wide
+	-- contact was being recorded as a narrow one, and only 22% of step portals
+	-- came out wide enough for a 4-stud body that could plainly walk them.
+	stepSample = 1.5,
 
 	-- How closely a smoothed segment must hug the corridor surface. Slack here
 	-- is what lets a shortcut float above the ground it is supposed to follow.
 	corridorSample = 1.0,
 	corridorTol = 1.5,
+	-- height change below which a step link is just a lip, not a step worth
+	-- pinning two waypoints for
+	stepPinMin = 0.75,
 }
 
 local function merged(cfg): any
 	local c = {}
 	for k, v in pairs(DEFAULT) do c[k] = v end
 	if cfg then for k, v in pairs(cfg) do if v ~= nil then c[k] = v end end end
+	-- The headroom filter IS the agent's standing height unless something has
+	-- deliberately overridden it. Leaving it nil silently routed a 5-stud body
+	-- through crawl space, which the bake had measured correctly all along.
+	if c.minClearance == nil and c.enforcePolyClearance then c.minClearance = c.agentHeight end
 	return c
 end
 
@@ -263,9 +313,20 @@ function Pathfinder.linkSteps(mesh: any, cfg: Config?): number
 					end
 
 					local half = (0.5 / (steps + 1)) -- half a sample spacing, in t
+					-- A step link is built from HEIGHT DIFFERENCE alone, so a floor
+					-- buried under an overlapping slab reads exactly like a kerb:
+					-- one stud down, step onto it. It is not a kerb -- that stud is
+					-- inside the slab. `liveCoverage` is measured at bake time
+					-- against the clearance-validated cell mask that killed those
+					-- cells in the first place.
+					local minCov = c.minLiveCoverage or 0.10
+					local covI = mesh.polys[i].liveCoverage
+					if covI == nil then covI = 1 end
 					for j, h in pairs(hits) do
+						local covJ = mesh.polys[j].liveCoverage
+						if covJ == nil then covJ = 1 end
 						local key = (i < j) and (i .. ":" .. j) or (j .. ":" .. i)
-						if not seen[key] then
+						if not seen[key] and covI >= minCov and covJ >= minCov then
 							seen[key] = true
 							-- widen by half a sample either way so a single-sample
 							-- contact is not a zero-length portal
@@ -425,6 +486,14 @@ function Pathfinder.searchPolys(mesh: any, startPoly: number, goalPoly: number, 
 			-- here too rather than trusted from link time
 			local climb = nb.climb
 			if climb and (climb > c.maxStepUp or climb < -c.maxStepDown) then blocked = true end
+			-- WIDTH, resolved here rather than baked. A portal is the ground the
+			-- two polygons actually share, so its length is the width of the gap
+			-- an agent has to pass through; a 4-stud body does not fit a 2-stud
+			-- doorway however walkable both sides are.
+			if c.enforcePortalWidth and c.agentRadius and c.agentRadius > 0 then
+				local pw = mesh.portals[nb.portal]
+				if pw and pw.length and pw.length < c.agentRadius * 2 - 1e-3 then blocked = true end
+			end
 			if not closed[other] and not blocked then
 				local portal = mesh.portals[nb.portal]
 				local mid = (portal.p1 + portal.p2) * 0.5
@@ -485,6 +554,48 @@ local function segmentInCorridor(mesh: any, corridor: {[number]: boolean}, a: Ve
 	return true
 end
 
+-- Does the AGENT'S BODY fit along this shortcut?
+--
+-- Corridor containment alone only asks whether the LINE stays over walkable
+-- polygons. A 4-stud-wide body cutting a corner clips the wall long before its
+-- centre line leaves the corridor, and where the mesh still covers a little
+-- solid, containment is satisfied by a polygon that should not be there.
+--
+-- An overlap probe, never a raycast: a ray never hits the part its origin is
+-- inside, and these samples sit right against surfaces. That trap has bitten
+-- this project in four separate probes.
+local function bodyFits(mesh: any, a: Vector3, b: Vector3, c: any): boolean
+	if not c.validateSolid or not c.agentRadius or c.agentRadius <= 0 then return true end
+	local pf = mesh._pf
+	if not pf then return true end
+	local probe = pf.bodyProbe
+	if not probe or not probe.Parent then
+		probe = Instance.new("Part")
+		probe.Name = "NVGN_BodyProbe"
+		probe.Anchored = true
+		probe.CanCollide = false
+		probe.CanQuery = false      -- a debug part that answers queries gets baked as floor
+		probe.CanTouch = false
+		probe.Transparency = 1
+		probe.Size = Vector3.new(c.agentRadius * 2, c.agentHeight, c.agentRadius * 2)
+		probe.Parent = workspace
+		pf.bodyProbe = probe
+		local op = OverlapParams.new()
+		op.FilterType = Enum.RaycastFilterType.Exclude
+		op.FilterDescendantsInstances = { probe, workspace:FindFirstChild("NVGN_Debug") }
+		pf.bodyParams = op
+	end
+	local d = (b - a).Magnitude
+	local n = math.max(1, math.floor(d / math.max(c.agentRadius, 0.5)))
+	for k = 0, n do
+		local p = a:Lerp(b, k / n)
+		-- the body stands ON the surface, so its centre is half a height up
+		probe.CFrame = CFrame.new(p + Vector3.new(0, c.agentHeight * 0.5, 0))
+		if #workspace:GetPartsInPart(probe, pf.bodyParams) > 0 then return false end
+	end
+	return true
+end
+
 function Pathfinder.stringPull(mesh: any, polyPath: {number}, portalPath: {number}, from: Vector3, to: Vector3, cfg: Config?): {Vector3}
 	local c = (mesh._pf and mesh._pf.config) or merged(cfg)
 	local corridor: {[number]: boolean} = {}
@@ -508,25 +619,43 @@ function Pathfinder.stringPull(mesh: any, polyPath: {number}, portalPath: {numbe
 		local pt = mesh.portals[ptIdx]
 		if pt then
 			local mid = (pt.p1 + pt.p2) * 0.5
-			if pt.kind == "step" then
-				local nextPoly = polyPath[k + 1]
-				local q = nextPoly and mesh.polys[nextPoly]
+			local nextPoly = polyPath[k + 1]
+			local q = nextPoly and mesh.polys[nextPoly]
+
+			-- Pin a step only where there is a step to pin. Pinning EVERY step
+			-- link forced two waypoints at every 0.2-stud lip, and on a
+			-- staircase -- one link per tread -- that is what turned a straight
+			-- flight into a zigzag climbing through the air.
+			local dy = 0
+			if q and containsXZ(q.verts, mid.X, mid.Z) then
+				dy = heightAt(q.verts, mid.X, mid.Z) - mid.Y
+			elseif q then
+				dy = (mesh._pf.centroids[nextPoly].Y) - mid.Y
+			end
+
+			if pt.kind == "step" and q and math.abs(dy) >= c.stepPinMin then
 				raw[#raw + 1] = mid
 				pinned[#raw] = true
-				if q then
-					-- step just inside the polygon being entered, and drop onto it
-					local cen = mesh._pf.centroids[nextPoly]
-					local dir = Vector3.new(cen.X - mid.X, 0, cen.Z - mid.Z)
-					local landing = mid
-					if dir.Magnitude > 1e-3 then
-						landing = mid + dir.Unit * math.min(c.stepProbe * 1.5, dir.Magnitude * 0.5)
-					end
-					local y = containsXZ(q.verts, landing.X, landing.Z)
-						and heightAt(q.verts, landing.X, landing.Z)
-						or heightAt(q.verts, cen.X, cen.Z)
-					raw[#raw + 1] = Vector3.new(landing.X, y, landing.Z)
-					pinned[#raw] = true
+				-- step just inside the polygon being entered, and drop onto it
+				local cen = mesh._pf.centroids[nextPoly]
+				local dir = Vector3.new(cen.X - mid.X, 0, cen.Z - mid.Z)
+				local landing = mid
+				if dir.Magnitude > 1e-3 then
+					landing = mid + dir.Unit * math.min(c.stepProbe * 1.5, dir.Magnitude * 0.5)
 				end
+				-- The landing must sit on the polygon being ENTERED, near the
+				-- portal. Falling back to the centroid's height put the waypoint
+				-- at the height of somewhere else entirely on a large polygon,
+				-- which is the waypoint hanging in mid-air over the stairs.
+				local y
+				if containsXZ(q.verts, landing.X, landing.Z) then
+					y = heightAt(q.verts, landing.X, landing.Z)
+				else
+					landing = mid
+					y = mid.Y + dy
+				end
+				raw[#raw + 1] = Vector3.new(landing.X, y, landing.Z)
+				pinned[#raw] = true
 			else
 				raw[#raw + 1] = mid
 			end
@@ -553,7 +682,9 @@ function Pathfinder.stringPull(mesh: any, polyPath: {number}, portalPath: {numbe
 			for k = i + 1, j - 1 do
 				if pinned[k] then crossesPin = true; break end
 			end
-			if not crossesPin and segmentInCorridor(mesh, corridor, raw[i], raw[j], c.corridorSample, c.corridorTol) then
+			if not crossesPin
+				and segmentInCorridor(mesh, corridor, raw[i], raw[j], c.corridorSample, c.corridorTol)
+				and bodyFits(mesh, raw[i], raw[j], c) then
 				best = j
 				break
 			end
