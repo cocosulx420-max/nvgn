@@ -75,6 +75,8 @@ export type Config = {
 	maxSlope: number?, seamEps: number?, seamDrop: number?,
 	maxTrim: number?, maxExtend: number?, vertexEps: number?, parallelEps: number?,
 	coplanarEps: number?,
+	-- set false to reproduce pre-fix behaviour for an A/B
+	killerRims: boolean?,
 }
 
 local DEFAULT = {
@@ -1022,11 +1024,254 @@ end
 
 --------------------------------------------------------------------------
 
+--------------------------------------------------------------------------
+-- Stage 2b — killer rims.
+--
+-- THE HOLE THIS FILLS. Every line above comes from a measuring ray, and a ray
+-- only ever fires from a LIVE cell at a frontier. So boundary can only be
+-- emitted where walkable ground survives beside it. Where a dead region abuts
+-- ANOTHER dead region -- one blocker's footprint running into the next -- there
+-- is no live cell to stand on, no ray, and no edge at all.
+--
+-- That is not a tolerance problem and no closure budget reaches it, because the
+-- partner line was never emitted. An unclosed line partitions nothing: the face
+-- walk simply runs around its free end, one face ends up holding both the live
+-- strip and hundreds of studs of solid, and polygonization faithfully turns
+-- that into a polygon you can walk through a wall on.
+--
+-- WHERE THE MISSING GEOMETRY COMES FROM. The parts responsible are already
+-- known: LocalGrid records a killer instance on every dead cell. A killer's own
+-- vertical faces, intersected with the floor's top plane, ARE the missing
+-- lines, and they are exact -- the blocker's authored geometry, no lattice term
+-- anywhere, the same {face plane} ∩ {floor top} construction used everywhere
+-- else.
+--
+-- THE DIVISION OF LABOUR IS UNCHANGED. The mask never supplies a coordinate. It
+-- only says which STRETCH of the line is real: the part of it that the killer
+-- actually shadows. Geometry decides exactly where; the mask decides where it
+-- applies. That is the same rule the rest of the pipeline runs on.
+--
+-- MEASURED GEOMETRY WINS. A stretch already carrying a measured edge on the
+-- same plane is left alone. These lines fill gaps and nothing else, which is
+-- both correct -- a ray that fired saw the real surface, including any lip or
+-- bevel a bounding face would miss -- and what keeps the edge count from
+-- doubling.
+--------------------------------------------------------------------------
+
+-- Clip a line to a rectangle lying in the same plane, returning a narrowed
+-- t-range. Two independent slabs; either can reject outright.
+local function clipToRect(X0: Vector3, D: Vector3, C: Vector3,
+	e1: Vector3, h1: number, e2: Vector3, h2: number, t0: number, t1: number)
+	local W = X0 - C
+	for _, pair in ipairs({ { e1, h1 }, { e2, h2 } }) do
+		local ax, h = pair[1] :: Vector3, pair[2] :: number
+		local denom = D:Dot(ax)
+		local off = W:Dot(ax)
+		if math.abs(denom) < 1e-6 then
+			-- parallel to this slab: inside or nothing
+			if math.abs(off) > h then return nil, nil end
+		else
+			local ta = (-h - off) / denom
+			local tb = (h - off) / denom
+			if ta > tb then ta, tb = tb, ta end
+			if ta > t0 then t0 = ta end
+			if tb < t1 then t1 = tb end
+			if t0 > t1 then return nil, nil end
+		end
+	end
+	return t0, t1
+end
+
+local function killerRims(raw: {Edge}, data: any, c: any): ({Edge}, any)
+	local report = { candidates = 0, emitted = 0, studs = 0, skippedCovered = 0, killers = 0 }
+
+	-- Existing lines, keyed by floor + plane orientation, so a killer rim can
+	-- tell whether this stretch was already measured.
+	local existing: { [string]: {Edge} } = {}
+	for _, e in ipairs(raw) do
+		local n = e.D:Cross(e.outDir)
+		if n.Magnitude > 1e-6 then
+			n = n.Unit
+		else
+			n = e.outDir
+		end
+		local key = string.format("%d|%d,%d,%d", iid(e.floor),
+			q(math.abs(n.X), c.normalEps), q(math.abs(n.Y), c.normalEps), q(math.abs(n.Z), c.normalEps))
+		local b = existing[key]
+		if not b then b = {}; existing[key] = b end
+		b[#b + 1] = e
+	end
+
+	local out: {Edge} = {}
+	for _, g in pairs(data.grids) do
+		if not g.fallback and g.dead and #g.dead > 0 and g.center then
+			local Fn = g.n or UP
+			local F0 = g.center
+
+			-- dead cells bucketed by world XZ, and the killers that made them
+			local deadAt: { [string]: {any} } = {}
+			local killers: { [Instance]: boolean } = {}
+			for _, d in ipairs(g.dead) do
+				local p = d.pos
+				if p then
+					local k = string.format("%d:%d", math.floor(p.X), math.floor(p.Z))
+					local b = deadAt[k]
+					if not b then b = {}; deadAt[k] = b end
+					b[#b + 1] = d
+					if d.killer then killers[d.killer] = true end
+				end
+			end
+
+			local function deadNear(p: Vector3, killer: Instance): boolean
+				local bx, bz = math.floor(p.X), math.floor(p.Z)
+				for dx = -1, 1 do
+					for dz = -1, 1 do
+						local b = deadAt[string.format("%d:%d", bx + dx, bz + dz)]
+						if b then
+							for _, d in ipairs(b) do
+								-- ANY dead cell counts, not only this killer's. At the one
+								-- place that matters -- where one footprint runs into the
+								-- next -- the cell outside belongs to the OTHER killer, and
+								-- demanding a match re-creates the very blind spot this
+								-- stage exists to fill.
+								if (killer == nil or d.killer == killer)
+									and math.abs(d.pos.Y - p.Y) <= c.coverTol
+									and math.abs(d.pos.X - p.X) <= c.step
+									and math.abs(d.pos.Z - p.Z) <= c.step then
+									return true
+								end
+							end
+						end
+					end
+				end
+				return false
+			end
+
+			for killer in pairs(killers) do
+				report.killers += 1
+				-- Blocks only. A Union's bounding faces are not its surface, and
+				-- synthesising a wall from a bbox is exactly the phantom geometry
+				-- the SVO work already showed is wrong; those stay deferred.
+				if killer:IsA("Part") and killer.Shape == Enum.PartType.Block then
+					local cf = killer.CFrame
+					local sz = killer.Size
+					local axes = {
+						{ cf.RightVector, sz.X * 0.5, cf.UpVector, sz.Y * 0.5, cf.LookVector, sz.Z * 0.5 },
+						{ cf.UpVector, sz.Y * 0.5, cf.RightVector, sz.X * 0.5, cf.LookVector, sz.Z * 0.5 },
+						{ cf.LookVector, sz.Z * 0.5, cf.RightVector, sz.X * 0.5, cf.UpVector, sz.Y * 0.5 },
+					}
+					for _, ax in ipairs(axes) do
+						local N, h = ax[1] :: Vector3, ax[2] :: number
+						-- a face parallel to the floor yields no usable line
+						if math.abs(N:Dot(Fn)) <= 0.94 then
+							for _, sgn in ipairs({ 1, -1 }) do
+								local P = killer.Position + N * (h * sgn)
+								local X0, D = intersectPlanes(N * sgn, P, Fn, F0)
+								if X0 then
+									X0 = X0 :: Vector3; D = D :: Vector3
+									report.candidates += 1
+									local t0, t1 = -1e6, 1e6
+									-- clip to the face rectangle, then the floor's
+									t0, t1 = clipToRect(X0, D, P, ax[3] :: Vector3, ax[4] :: number,
+										ax[5] :: Vector3, ax[6] :: number, t0, t1)
+									if t0 then
+										t0, t1 = clipToRect(X0, D, g.center, g.u, g.uExt, g.v, g.vExt,
+											t0 :: number, t1 :: number)
+									end
+									if t0 and (t1 :: number) - (t0 :: number) >= c.minRun then
+										-- mask SELECTS the extent: keep only where
+										-- this killer actually shadows this floor
+										local outDir = D:Cross(Fn)
+										if outDir.Magnitude < 1e-4 then continue end
+										outDir = outDir.Unit
+										-- orient outward = toward the killer's body
+										if outDir:Dot(killer.Position - X0) < 0 then outDir = -outDir end
+
+										local key = string.format("%d|%d,%d,%d", iid(g.part),
+											q(math.abs(N.X), c.normalEps), q(math.abs(N.Y), c.normalEps),
+											q(math.abs(N.Z), c.normalEps))
+										local prior = existing[key]
+
+										local pitch = c.step * 0.5
+										local runA: number? = nil
+										local tt = t0 :: number
+										-- Coverage belongs in the MASK, tested per sample.
+										-- Judging a whole run by its midpoint threw away a
+										-- 21-stud line because a measured 10-stud edge sat
+										-- over its middle -- discarding exactly the gap the
+										-- line existed to fill.
+										local function coveredAt(p: Vector3): boolean
+											if not prior then return false end
+											for _, e in ipairs(prior) do
+												local w = p - e.X0
+												local along = w:Dot(e.D)
+												local perp = (w - e.D * along).Magnitude
+												local ea = (e.a - e.X0):Dot(e.D)
+												local eb = (e.b - e.X0):Dot(e.D)
+												if ea > eb then ea, eb = eb, ea end
+												if perp <= c.coplanarEps and along >= ea - c.step and along <= eb + c.step then
+													return true
+												end
+											end
+											return false
+										end
+										local function flush(tEnd: number)
+											if runA and (tEnd - runA) >= c.minRun then
+												out[#out + 1] = {
+													a = X0 + D * runA, b = X0 + D * tEnd,
+													class = "wall", floor = g.part, source = killer,
+													outDir = outDir, lineId = key .. "|kr" .. tostring(iid(killer)),
+													X0 = X0, D = D, samples = 0,
+													closedA = false, closedB = false,
+												}
+												report.emitted += 1
+												report.studs += (tEnd - runA)
+											end
+											runA = nil
+										end
+										while tt <= (t1 :: number) do
+											local p = X0 + D * tt
+											-- shadowed on the killer's side, and not already measured
+											local want = deadNear(p + outDir * (c.step * 0.5), nil)
+											if want and coveredAt(p) then
+												want = false
+												report.skippedCovered += 1
+											end
+											if want then
+												if not runA then runA = tt end
+											else
+												flush(tt - pitch)
+											end
+											tt += pitch
+										end
+										flush(t1 :: number)
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return out, report
+end
+
+--------------------------------------------------------------------------
+
 function Clean.fromLocal(data: any, cfg: Config?)
 	local c = merged(cfg)
 	local t0 = os.clock()
 	local samples, sstats = sampleFrontier(data, c)
 	local raw = buildRuns(samples, c)
+	-- fill the gaps frontier sampling structurally cannot reach, BEFORE closure,
+	-- so the new lines take part in vertex construction like any other
+	local krReport = nil
+	if c.killerRims ~= false then
+		local kr, kreport = killerRims(raw, data, c)
+		krReport = kreport
+		for _, e in ipairs(kr) do raw[#raw + 1] = e end
+	end
 	local edges, report = closeAll(raw, data, c)
 	edges = bridgeDeferred(edges, data, c, report)
 
@@ -1041,6 +1286,7 @@ function Clean.fromLocal(data: any, cfg: Config?)
 		stats = {
 			samples = sstats, rawRuns = #raw, edges = #edges,
 			byClass = byClass, studs = studs, closure = report,
+			killerRims = krReport,
 			seconds = os.clock() - t0,
 		},
 	}
