@@ -1320,4 +1320,119 @@ function Polys.visualize(res: any, parent: Instance?)
 	return folder
 end
 
+--------------------------------------------------------------------------
+-- Filled polygon debug.
+--
+-- Edge bars alone show where boundaries are but not what a polygon CLAIMS,
+-- and the claim is the thing under suspicion: a polygon covering a wall looks
+-- identical to a correct one until its interior is visible. So the face is
+-- filled, semi-transparent, with a distinct hue per polygon so neighbouring
+-- polygons separate instead of merging into one sheet.
+--
+-- Edges keep the pipeline's established legend, drawn above the fill:
+--   red = wall, cyan = dropoff, green = seam, yellow = tier,
+--   grey = continuation, purple = internal (polygonization's own cuts).
+--
+-- Debug parts must never answer a spatial query, or the next bake picks them
+-- up as walkable floor. This project has been bitten by that twice.
+--------------------------------------------------------------------------
+
+local function wedgePair(a: Vector3, b: Vector3, cc: Vector3, parent: Instance,
+	colour: Color3, trans: number)
+	-- classic two-wedge triangle: rotate so the right angle sits opposite the
+	-- longest edge, then split there
+	local ab, ac, bc = b - a, cc - a, cc - b
+	local abd, acd, bcd = ab:Dot(ab), ac:Dot(ac), bc:Dot(bc)
+	if abd > acd and abd > bcd then
+		cc, a = a, cc
+	elseif acd > bcd and acd > abd then
+		a, b = b, a
+	end
+	ab, ac, bc = b - a, cc - a, cc - b
+	local cross = ac:Cross(ab)
+	if cross.Magnitude < 1e-6 or bc.Magnitude < 1e-6 then return end
+	local right = cross.Unit
+	local up = bc:Cross(right)
+	if up.Magnitude < 1e-6 then return end
+	up = up.Unit
+	local back = bc.Unit
+	local height = math.abs(ab:Dot(up))
+	if height < 1e-4 then return end
+
+	for _, spec in ipairs({ { (a + b) * 0.5, right, back, ab }, { (a + cc) * 0.5, -right, -back, ac } }) do
+		local w = Instance.new("WedgePart")
+		w.Anchored = true
+		w.CanCollide = false
+		w.CanQuery = false
+		w.CanTouch = false
+		w.Material = Enum.Material.SmoothPlastic
+		w.Color = colour
+		w.Transparency = trans
+		w.Size = Vector3.new(0.05, height, math.abs((spec[4] :: Vector3):Dot(back)))
+		w.CFrame = CFrame.fromMatrix(spec[1] :: Vector3, spec[2] :: Vector3, up, spec[3] :: Vector3)
+		w.Parent = parent
+	end
+end
+
+function Polys.visualizeFilled(res: any, parent: Instance?, opts: any?)
+	local o = opts or {}
+	local fillTrans = o.fillTransparency or 0.55
+	local lift = o.lift or 0.06
+	local root = parent or workspace
+	local dbg = root:FindFirstChild("NVGN_Debug")
+	if not dbg then dbg = Instance.new("Folder"); dbg.Name = "NVGN_Debug"; dbg.Parent = root end
+	local old = dbg:FindFirstChild("Polys")
+	if old then old:Destroy() end
+	local folder = Instance.new("Folder"); folder.Name = "Polys"; folder.Parent = dbg
+
+	local UPV = Vector3.new(0, 1, 0)
+	local colours = {
+		wall = Color3.new(1, 0.15, 0.15),
+		seam = Color3.new(0.2, 1, 0.35),
+		dropoff = Color3.new(0.15, 0.9, 1),
+		tier = Color3.new(0.95, 0.85, 0.1),
+		continuation = Color3.new(0.6, 0.6, 0.65),
+		internal = Color3.new(0.45, 0.35, 0.8),
+	}
+
+	local n = 0
+	for pi, p in ipairs(res.polys) do
+		local sub = Instance.new("Folder")
+		sub.Name = string.format("P%d_%s_%s_a%.0f_v%d_f%.2f",
+			pi, p.floor.Name, p.kind, p.area, #p.verts, p.fatness)
+		sub.Parent = folder
+
+		-- fill: fan from vertex 1; polygons are convex by construction
+		local hue = (pi * 0.6180339887) % 1
+		local fill = Color3.fromHSV(hue, 0.75, 1)
+		local vs = p.verts
+		local nrm = p.normal or UPV
+		for i = 2, #vs - 1 do
+			wedgePair(vs[1] + nrm * lift, vs[i] + nrm * lift, vs[i + 1] + nrm * lift,
+				sub, fill, fillTrans)
+			n += 2
+		end
+
+		for i = 1, #vs do
+			local a, b = vs[i], vs[(i % #vs) + 1]
+			local d = b - a
+			if d.Magnitude > 1e-3 then
+				local cls = p.classes[i]
+				local bar = Instance.new("Part")
+				bar.Anchored = true; bar.CanCollide = false; bar.CanQuery = false; bar.CanTouch = false
+				bar.Size = Vector3.new(d.Magnitude, 0.2, 0.2)
+				bar.Color = colours[cls] or Color3.new(1, 1, 1)
+				bar.Material = Enum.Material.Neon
+				if cls == "internal" then bar.Transparency = 0.4 else bar.Transparency = 0 end
+				bar.CFrame = CFrame.fromMatrix((a + b) * 0.5 + UPV * (lift + 0.12), d.Unit, UPV)
+				bar.Name = cls
+				bar.Parent = sub
+				n += 1
+			end
+		end
+		if pi % 250 == 0 then task.wait() end
+	end
+	return folder, n
+end
+
 return Polys
