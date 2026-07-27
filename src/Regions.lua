@@ -55,6 +55,10 @@ local DEFAULT = {
 	coverTol = 0.35,
 	planeReach = 1.6,
 	parallelEps = 1e-4,
+	-- how far a computed vertex may sit from the lattice corner it replaces.
+	-- The mask locates that corner to within half a cell; anything beyond this
+	-- is a near-parallel intersection running away, not a real corner.
+	maxVertexSnap = 1.5,
 	minClearance = 1.5,
 }
 
@@ -172,7 +176,7 @@ function Regions.fromLocal(data: any, cfg: Config?)
 	local stats = {
 		grids = 0, components = 0, rings = 0, holes = 0,
 		fromKiller = 0, fromQuery = 0, fromRim = 0, fromLattice = 0,
-		cells = 0, area = 0, degenerateVerts = 0,
+		cells = 0, area = 0, degenerateVerts = 0, runawayVerts = 0,
 	}
 
 	local DIRS = { { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } }
@@ -410,6 +414,12 @@ function Regions.fromLocal(data: any, cfg: Config?)
 						for i = 1, n do
 							local cur = runs[i]
 							local nxt = runs[(i % n) + 1]
+							-- the corner this vertex replaces. The mask locates it to
+							-- within half a cell, which is the budget an exact vertex
+							-- is allowed to move -- the same asymmetric-budget argument
+							-- Clean already uses for outward snapping.
+							local endCorner = cur.segs[#cur.segs].b
+							local anchor = corner(endCorner[1], endCorner[2])
 							local v: Vector3? = nil
 							if cur.X0 and nxt.X0 then
 								-- solve in the floor's own 2D frame
@@ -420,13 +430,22 @@ function Regions.fromLocal(data: any, cfg: Config?)
 								local den = d1x * d2y - d1y * d2x
 								if math.abs(den) > c.parallelEps then
 									local t = ((p2x - p1x) * d2y - (p2y - p1y) * d2x) / den
-									v = cur.X0 + cur.D * t
+									local cand = cur.X0 + cur.D * t
+									-- REJECT A RUNAWAY INTERSECTION. Two runs that are
+									-- nearly parallel still pass parallelEps, and their
+									-- crossing then lands hundreds of studs away. One
+									-- such vertex on a 12x12 SpawnLocation produced a
+									-- region of 566,098 studs2 from 122 cells -- 93% of
+									-- the whole map's over-claim, from a single corner.
+									if (cand - anchor).Magnitude <= c.maxVertexSnap then
+										v = cand
+									else
+										stats.runawayVerts += 1
+									end
 								end
 							end
 							if not v then
-								-- shared lattice corner between the two runs
-								local endCorner = cur.segs[#cur.segs].b
-								v = corner(endCorner[1], endCorner[2])
+								v = anchor
 								stats.degenerateVerts += 1
 							end
 							verts[#verts + 1] = v

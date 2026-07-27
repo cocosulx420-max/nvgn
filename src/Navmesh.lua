@@ -31,8 +31,7 @@
 -- by dropping or hopping are correctly disconnected. Destruction is unbuilt.
 
 local LocalGrid = require(script.Parent:WaitForChild("LocalGrid"))
-local Clean = require(script.Parent:WaitForChild("Clean"))
-local Loops = require(script.Parent:WaitForChild("Loops"))
+local Regions = require(script.Parent:WaitForChild("Regions"))
 local Polys = require(script.Parent:WaitForChild("Polys"))
 local Portals = require(script.Parent:WaitForChild("Portals"))
 local Volumes = require(script.Parent:WaitForChild("Volumes"))
@@ -77,13 +76,20 @@ function Navmesh.build(cfg: any?)
 	local data, floorData, tree, parts = LocalGrid.build(cfg)
 	t = mark("localgrid", t)
 
-	local cres = Clean.fromLocal(data, cfg)
-	t = mark("clean", t)
+	-- Regions replaces Clean + Loops. Those built a region as the floor's rim
+	-- rectangle cut by emitted boundary lines, with the mask only SELECTING
+	-- which faces survived -- so a face holding a live strip plus hundreds of
+	-- studs of dead ground was kept whole, and a polygon covered a wall. A line
+	-- partitions a face only if it CLOSES, and on authored geometry they mostly
+	-- do not, which is why adding exact lines never fixed it.
+	--
+	-- Tracing the live-cell frontier instead makes closure free: the boundary of
+	-- a set of cells is a closed loop by construction. The mask decides
+	-- topology, geometry still decides every coordinate.
+	local rres = Regions.fromLocal(data, cfg)
+	t = mark("regions", t)
 
-	local lres = Loops.fromClean(cres, data, cfg)
-	t = mark("loops", t)
-
-	local pres = Polys.fromLoops(lres, cfg)
+	local pres = Polys.fromLoops(rres, cfg)
 	t = mark("polys", t)
 
 	local ptres = Portals.fromPolys(pres, cfg)
@@ -135,7 +141,7 @@ function Navmesh.build(cfg: any?)
 		stats = stats,
 		-- stage results kept for debugging and for the viz helpers
 		stages = { data = data, floor = floorData, parts = parts, svo = tree,
-			clean = cres, loops = lres, polys = pres, portals = ptres, volumes = vres },
+			regions = rres, polys = pres, portals = ptres, volumes = vres },
 	}
 end
 
