@@ -743,31 +743,51 @@ local function clearOfEdges(mesh: any, w: Vector3, c: any): Vector3
 	local pi = Pathfinder.locate(mesh, w)
 	if not pi then return w end
 	local p = mesh.polys[pi]
-	local cen = mesh._pf.centroids[pi]
 
+	-- EVERY nearby polygon's walls, not just the one the waypoint stands in.
+	-- At a corner the two walls almost always belong to two DIFFERENT polygons,
+	-- so looking only at the containing polygon finds one of them and pushes
+	-- along a single axis -- straight down the other wall. Both have to push,
+	-- and their sum is the diagonal that actually clears the corner.
+	local nearby = polysNear(mesh._pf.polyIndex, w.X, w.Z, POLY_CELL, need + 1)
 	local push = Vector3.zero
-	for e = 1, #p.verts do
-		local cls = p.classes[e]
-		if cls == "wall" or cls == "dropoff" then
-			local v1 = p.verts[e]
-			local v2 = p.verts[(e % #p.verts) + 1]
-			local dx, dz = v2.X - v1.X, v2.Z - v1.Z
-			local L2 = dx * dx + dz * dz
-			if L2 > 1e-9 then
-				local t = ((w.X - v1.X) * dx + (w.Z - v1.Z) * dz) / L2
-				if t < 0 then t = 0 elseif t > 1 then t = 1 end
-				local qx, qz = v1.X + dx * t, v1.Z + dz * t
-				local d = math.sqrt((w.X - qx) ^ 2 + (w.Z - qz) ^ 2)
-				if d < need then
-					-- inward normal from the EDGE, not from the waypoint: a
-					-- waypoint sitting exactly on the edge gives a zero-length
-					-- direction, and a corner is precisely that case
-					local nx, nz = -dz, dx
-					local m = math.sqrt(nx * nx + nz * nz)
-					nx, nz = nx / m, nz / m
-					if (cen.X - qx) * nx + (cen.Z - qz) * nz < 0 then nx, nz = -nx, -nz end
-					local k = need - d
-					push = push + Vector3.new(nx * k, 0, nz * k)
+	local seen: {[string]: boolean} = {}
+	for _, qi in ipairs(nearby) do
+		local q = mesh.polys[qi]
+		local cen = mesh._pf.centroids[qi]
+		-- only walls on this storey: a wall one floor up is not our problem
+		if q and math.abs(cen.Y - w.Y) <= c.heightTolerance then
+			for e = 1, #q.verts do
+				local cls = q.classes[e]
+				if cls == "wall" or cls == "dropoff" then
+					local v1 = q.verts[e]
+					local v2 = q.verts[(e % #q.verts) + 1]
+					local dx, dz = v2.X - v1.X, v2.Z - v1.Z
+					local L2 = dx * dx + dz * dz
+					if L2 > 1e-9 then
+						local t = ((w.X - v1.X) * dx + (w.Z - v1.Z) * dz) / L2
+						if t < 0 then t = 0 elseif t > 1 then t = 1 end
+						local qx, qz = v1.X + dx * t, v1.Z + dz * t
+						local d = math.sqrt((w.X - qx) ^ 2 + (w.Z - qz) ^ 2)
+						if d < need then
+							-- inward normal from the EDGE, not from the waypoint: a
+							-- waypoint sitting exactly on the edge gives a zero-length
+							-- direction, and a corner is precisely that case
+							local nx, nz = -dz, dx
+							local m = math.sqrt(nx * nx + nz * nz)
+							nx, nz = nx / m, nz / m
+							if (cen.X - qx) * nx + (cen.Z - qz) * nz < 0 then nx, nz = -nx, -nz end
+							-- two polygons often meet along the SAME wall, so the same
+							-- physical surface would otherwise push twice as hard
+							local key = string.format("%d:%d:%d:%d",
+								math.floor(qx * 4), math.floor(qz * 4),
+								math.floor(nx * 8), math.floor(nz * 8))
+							if not seen[key] then
+								seen[key] = true
+								push = push + Vector3.new(nx * (need - d), 0, nz * (need - d))
+							end
+						end
+					end
 				end
 			end
 		end
@@ -777,10 +797,23 @@ local function clearOfEdges(mesh: any, w: Vector3, c: any): Vector3
 	-- back off until the polygon still contains the result: in a corridor
 	-- narrower than the body there is nowhere safe to stand, and shoving the
 	-- waypoint out of its own polygon would be worse than leaving it be
-	for _, scale in ipairs({ 1.0, 0.66, 0.33 }) do
+	for _, scale in ipairs({ 1.0, 0.75, 0.5, 0.25 }) do
 		local cand = w + push * scale
+		-- the original polygon first, since staying put is cheapest...
 		if containsXZ(p.verts, cand.X, cand.Z) then
 			return Vector3.new(cand.X, heightAt(p.verts, cand.X, cand.Z), cand.Z)
+		end
+		-- ...but a diagonal push at a corner routinely lands in the NEIGHBOURING
+		-- polygon, which is walkable ground just the same. Requiring the original
+		-- polygon here would reject exactly the corner case this exists for.
+		for _, qi in ipairs(polysAt(mesh._pf.polyIndex, cand.X, cand.Z, POLY_CELL)) do
+			local q = mesh.polys[qi]
+			if containsXZ(q.verts, cand.X, cand.Z) then
+				local y = heightAt(q.verts, cand.X, cand.Z)
+				if math.abs(y - w.Y) <= c.corridorTol then
+					return Vector3.new(cand.X, y, cand.Z)
+				end
+			end
 		end
 	end
 	return w
