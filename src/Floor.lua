@@ -5,7 +5,8 @@
 -- (solid voxels with empty space above); each candidate's top face is walked at
 -- 1-stud resolution and a raycast onto the REAL part gives exact height + normal
 -- (so ramps are smooth, not stair-stepped, and a collapsed node covering several
--- parts is sampled per-cell). Clearance is an upward raycast to the real ceiling.
+-- parts is sampled per-cell). Clearance = precise overlap probe (embedded-origin
+-- detection) + upward raycast to the real ceiling; terrain via a separate ray pair.
 -- Only walkable surfels are kept (steep faces feed the later boundary stage).
 
 local SVO = require(script.Parent:WaitForChild("SVO"))
@@ -16,7 +17,7 @@ export type Surfel = {
 	pos: Vector3,       -- exact surface position
 	normal: Vector3,    -- surface normal
 	slope: number,      -- degrees from world-up
-	clearance: number,  -- studs of headroom above (capped)
+	clearance: number,  -- studs of headroom above (capped; 0 = embedded/dead space)
 	part: BasePart,     -- the part under this surfel
 }
 
@@ -27,7 +28,7 @@ export type Surfel = {
 
 export type Config = {
 	leaf: number?, maxSlope: number?, agentHeight: number?,
-	clearCap: number?, maxGroundFootprint: number?,
+	clearCap: number?, maxGroundFootprint: number?, minClearance: number?,
 }
 
 local DEFAULT = {
@@ -36,6 +37,7 @@ local DEFAULT = {
 	agentHeight = 5,          -- reference stand height
 	clearCap = 20,            -- clearance raycast cap
 	maxGroundFootprint = 400, -- parts wider than this (baseplate) are excluded
+	minClearance = 1.5,       -- headroom below this is dead space (crawl floor)
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -83,6 +85,22 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	rp.FilterType = Enum.RaycastFilterType.Include
 	rp.FilterDescendantsInstances = parts
 
+	-- Embedded-origin probe: a thin invisible part spanning [0.1, minClearance]
+	-- above each candidate, tested with precise GetPartsInPart (see clearance
+	-- note below for why raycasts cannot do this job).
+	local probe = Instance.new("Part")
+	probe.Name = "NVGN_ClearProbe"
+	probe.Size = Vector3.new(0.05, c.minClearance - 0.1, 0.05)
+	probe.Anchored = true; probe.CanCollide = false; probe.CanQuery = false; probe.CanTouch = false
+	probe.Transparency = 1
+	probe.Parent = workspace
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Include
+	op.FilterDescendantsInstances = parts
+	local rpTerrain = RaycastParams.new()
+	rpTerrain.FilterType = Enum.RaycastFilterType.Include
+	rpTerrain.FilterDescendantsInstances = { workspace.Terrain }
+
 	local surfels: {Surfel} = {}
 	local index: { [string]: {Surfel} } = {}
 
@@ -100,9 +118,36 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 				local slope = math.deg(math.acos(math.clamp(n:Dot(UP), -1, 1)))
 				local isClip = res.Instance.Name:find("ClipRamp") ~= nil
 				if not ((slope <= c.maxSlope) or isClip) then continue end
-				-- clearance: upward raycast to the real ceiling
-				local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), Vector3.new(0, c.clearCap, 0), rp)
-				local clearance = upRes and upRes.Distance or c.clearCap
+				-- Clearance. A raycast NEVER hits a part its origin is inside, so
+				-- ray logic alone cannot detect an embedded origin (wall flush on
+				-- the floor, buried overlap region, curved union). Precise overlap
+				-- probe first: any foreign solid crossing [0.1, minClearance] above
+				-- the surface means true headroom < minClearance -> clearance 0
+				-- (surfel kept, truthful for the global index). Host excluded; a
+				-- non-convex host's self-overhang is covered by the SVO empty-above
+				-- guard at voxel scale. A clear probe guarantees the up-ray origin
+				-- is outside every collider, making its distance exact.
+				local clearance
+				probe.CFrame = CFrame.new(res.Position + Vector3.new(0, 0.1 + (c.minClearance - 0.1) * 0.5, 0))
+				local blocked = false
+				for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
+					if hit ~= res.Instance then blocked = true; break end
+				end
+				if blocked then
+					clearance = 0
+				else
+					local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), Vector3.new(0, c.clearCap, 0), rp)
+					clearance = upRes and upRes.Distance or c.clearCap
+					-- Terrain is not in `parts` (never walkable) but still blocks
+					-- headroom; overlap queries are parts-only, so use a terrain-only
+					-- ray pair (down-ray catches embedded origin under a blob).
+					local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), Vector3.new(0, c.clearCap, 0), rpTerrain)
+					if tUp then
+						clearance = math.min(clearance, tUp.Distance)
+					elseif workspace:Raycast(res.Position + Vector3.new(0, c.clearCap, 0), Vector3.new(0, -(c.clearCap - 0.25), 0), rpTerrain) then
+						clearance = 0
+					end
+				end
 				local surfel: Surfel = {
 					pos = res.Position, normal = n, slope = slope,
 					clearance = clearance, part = res.Instance,
@@ -115,6 +160,7 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 			end
 		end
 	end)
+	probe:Destroy()
 
 	return { surfels = surfels, index = index, config = c }
 end
