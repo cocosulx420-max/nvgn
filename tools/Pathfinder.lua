@@ -78,13 +78,21 @@ local DEFAULT = {
 	-- Drop links the agent cannot actually cross. A portal says two polygons
 	-- share ground, not that nothing stands between them.
 	--
-	-- OFF, because measurement says it does not pay: it drops 3,183 links and
-	-- cuts routing from 11% to 4%, while through-wall samples move only 13.38%
-	-- -> 12.88%. So links crossing walls are NOT where the remaining clipping
-	-- comes from, and paying a third of the graph for half a percentage point is
-	-- the wrong trade. Kept because the rule is sound and will matter once the
-	-- real source is found; turn it on to A/B.
-	validateLinks = false,
+	-- ON. `linkSteps` probes `stepProbe` studs past an edge and links to whatever
+	-- floor it finds at a walkable height difference -- and a 1-stud-thick wall
+	-- is EXACTLY that probe distance, so it lands on the far side, records
+	-- climb = 0, and links straight through the wall. Traced on a real case:
+	-- portal 8596, a step portal of length 1.00 sitting on a door jamb's face,
+	-- joining two polygons whose edges both stop correctly ON that face. With
+	-- validation the link is dropped and the route no longer crosses the jamb.
+	--
+	-- I previously turned this OFF on a bad measurement: a 4-stud column at path
+	-- height that trips on overhangs and on paths legitimately hugging a wall,
+	-- which buried the real effect in noise. The single traced case settled it.
+	--
+	-- It costs connectivity -- 3,183 links, routing 11% -> 4% -- and that is the
+	-- honest price of not walking through 1-stud walls in a map built from them.
+	validateLinks = true,
 	-- the probe stands ON the surface, so lift it clear of the floor it rests on
 	linkFootLift = 0.15,
 	-- and give back a little headroom, so a doorway trimmed exactly to agent
