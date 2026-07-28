@@ -75,6 +75,24 @@ local DEFAULT = {
 	enforcePolyClearance = false,
 	enforcePortalWidth = false,
 
+	-- Drop links the agent cannot actually cross. A portal says two polygons
+	-- share ground, not that nothing stands between them.
+	--
+	-- OFF, because measurement says it does not pay: it drops 3,183 links and
+	-- cuts routing from 11% to 4%, while through-wall samples move only 13.38%
+	-- -> 12.88%. So links crossing walls are NOT where the remaining clipping
+	-- comes from, and paying a third of the graph for half a percentage point is
+	-- the wrong trade. Kept because the rule is sound and will matter once the
+	-- real source is found; turn it on to A/B.
+	validateLinks = false,
+	-- the probe stands ON the surface, so lift it clear of the floor it rests on
+	linkFootLift = 0.15,
+	-- and give back a little headroom, so a doorway trimmed exactly to agent
+	-- height is not rejected by float noise
+	linkHeadroomSlack = 0.3,
+	-- thin: asks whether the boundary is solid, not whether the body fits on it
+	linkProbeWidth = 0.4,
+
 	-- Agent mobility. These belong to the AGENT, not to the bake, which is why
 	-- they live here as query parameters and not as baked flags.
 	linkSteps = true,
@@ -377,6 +395,87 @@ local function stripStepLinks(mesh: any)
 	end
 end
 
+-- CAN THE AGENT ACTUALLY CROSS THIS LINK?
+--
+-- A portal says two polygons share ground. It does NOT say anything stands
+-- between them. `linkSteps` builds a link from height difference alone, and
+-- geometric portal matching does the same across a shared wall, so a wall with
+-- floor on both sides yields a link straight through it. That is what a route
+-- crossing a wall in a single straight run actually is -- not a smoothing
+-- artefact. Measured: the raw portal corridor clips solid MORE than the
+-- smoothed path does (16.7% vs 14.7%), so smoothing was never the cause.
+--
+-- Sample ACROSS the shared edge at several points and let the link live if ANY
+-- of them is clear. A doorway in a wall is exactly the case where most of the
+-- edge is blocked and one stretch is not, and rejecting the whole link there
+-- would wall off rooms that are genuinely connected.
+--
+-- Overlap probe, never a ray: these samples sit against surfaces, and a ray
+-- never hits the part its origin is inside.
+local function linkPassable(mesh: any, pt: any, c: any): boolean
+	local pf = mesh._pf
+	local probe = pf.linkProbe
+	if not probe or not probe.Parent then
+		probe = Instance.new("Part")
+		probe.Name = "NVGN_LinkProbe"
+		probe.Anchored = true
+		probe.CanCollide = false
+		probe.CanQuery = false
+		probe.CanTouch = false
+		probe.Transparency = 1
+		-- A THIN column, not the full body. The question here is whether the
+		-- BOUNDARY ITSELF is solid, not whether the body fits centred on it: a
+		-- portal running alongside a wall is perfectly crossable, but a
+		-- body-width probe standing on that edge overlaps the wall and the link
+		-- is thrown away. That over-rejection dropped 4,461 links and cut routing
+		-- from 11% to 2%. Width belongs to `bodyFits` along the route.
+		probe.Size = Vector3.new(c.linkProbeWidth, c.agentHeight - c.linkHeadroomSlack, c.linkProbeWidth)
+		probe.Parent = workspace
+		pf.linkProbe = probe
+		local op = OverlapParams.new()
+		op.FilterType = Enum.RaycastFilterType.Exclude
+		op.FilterDescendantsInstances = { probe, workspace:FindFirstChild("NVGN_Debug") }
+		pf.linkParams = op
+	end
+
+	local A, B = mesh.polys[pt.a], mesh.polys[pt.b]
+	if not A or not B then return true end
+	-- stand on the HIGHER of the two surfaces: a riser never reaches above its
+	-- own upper tread, but a wall on the boundary always does
+	local span = (pt.p2 - pt.p1)
+	local n = math.max(1, math.ceil(span.Magnitude / math.max(c.agentRadius * 2, 1)))
+	for i = 0, n do
+		local p = pt.p1 + span * (i / n)
+		local ya = containsXZ(A.verts, p.X, p.Z) and heightAt(A.verts, p.X, p.Z) or p.Y
+		local yb = containsXZ(B.verts, p.X, p.Z) and heightAt(B.verts, p.X, p.Z) or p.Y
+		local base = math.max(ya, yb)
+		probe.CFrame = CFrame.new(Vector3.new(p.X,
+			base + c.linkFootLift + (c.agentHeight - c.linkHeadroomSlack) * 0.5, p.Z))
+		if #workspace:GetPartsInPart(probe, pf.linkParams) == 0 then
+			return true      -- one clear crossing is enough
+		end
+	end
+	return false
+end
+
+local function validateLinks(mesh: any, c: any): number
+	local dropped = 0
+	local bad: { [number]: boolean } = {}
+	for i, pt in ipairs(mesh.portals) do
+		if not linkPassable(mesh, pt, c) then bad[i] = true; dropped += 1 end
+	end
+	if dropped == 0 then return 0 end
+	for i = 1, #mesh.polys do
+		local list = mesh.neighbours[i] or {}
+		local keep = {}
+		for _, nb in ipairs(list) do
+			if not bad[nb.portal] then keep[#keep + 1] = nb end
+		end
+		mesh.neighbours[i] = keep
+	end
+	return dropped
+end
+
 -- Prepares the derived tables a query needs. Safe to call again to re-target a
 -- different agent.
 function Pathfinder.prepare(mesh: any, cfg: Config?): any
@@ -387,7 +486,19 @@ function Pathfinder.prepare(mesh: any, cfg: Config?): any
 	-- built once here rather than per call: linkSteps below hits it tens of
 	-- thousands of times, and `locate` runs every frame the demo re-paths
 	mesh._pf = { centroids = centroids, config = c, polyIndex = polyIndex(mesh.polys, POLY_CELL) }
-	mesh._pf.stepLinks = c.linkSteps and Pathfinder.linkSteps(mesh, c) or 0
+	-- explicit branch: `cond and X or Y` returns Y whenever X is 0-or-false, and
+	-- that pattern has silently produced wrong values three times in this project
+	if c.linkSteps then
+		mesh._pf.stepLinks = Pathfinder.linkSteps(mesh, c)
+	else
+		mesh._pf.stepLinks = 0
+	end
+	-- after step links exist, so newly minted ones are checked too
+	if c.validateLinks then
+		mesh._pf.droppedLinks = validateLinks(mesh, c)
+	else
+		mesh._pf.droppedLinks = 0
+	end
 	return mesh
 end
 
