@@ -608,6 +608,92 @@ function Bounds.wallGeometry(result: any, footData: any, localData: any, cfg: Co
 end
 
 --------------------------------------------------------------------------------
+-- Deduplicate collinear wall runs
+--------------------------------------------------------------------------------
+-- Several killers can cut the same stretch of floor — a wall and the step above
+-- it, two stacked parts, a block abutting a stair — and each one's cut contour
+-- then emits its own run along the same line. The debug draw showed this as one
+-- bright line with others buried inside it: three 30-stud runs stacked at one
+-- spot, two 35-stud runs at another.
+--
+-- Picking a single "owner" per edge was what the old probe filter tried to do,
+-- and it failed either by dropping walls or by duplicating them. Emitting freely
+-- and then merging is robust: group runs that lie on the same line, then union
+-- their intervals along it. Genuinely disjoint stretches on one line — either
+-- side of a doorway — stay separate, because their intervals do not overlap.
+
+function Bounds.dedupeWalls(result: any)
+	local Q = 0.25
+	local function q(v: number): number
+		return math.floor(v / Q + 0.5)
+	end
+
+	local groups, others = {}, {}
+	for _, run in ipairs(result.runs) do
+		local d = run.b - run.a
+		local len = d.Magnitude
+		if run.kind ~= "wall" or run.source == "stitch" or len < 1e-4 then
+			others[#others + 1] = run
+			continue
+		end
+		local t = d / len
+		-- canonical direction, so a run and its reverse land in one group
+		if t.X < -1e-6 or (math.abs(t.X) <= 1e-6 and t.Z < -1e-6) then
+			t = -t
+		end
+		local n = run.outDir
+		local nl = n.Magnitude
+		n = (nl > 1e-6) and (n / nl) or Vector3.xAxis
+		local k = ("%d,%d,%d,%d,%d"):format(
+			q(t.X * 4), q(t.Z * 4), q(run.a:Dot(n)), q(run.a.Y), q(n.X * 4))
+		local g = groups[k]
+		if not g then g = { t = t, runs = {} }; groups[k] = g end
+		g.runs[#g.runs + 1] = run
+	end
+
+	local removed = 0
+	for _, g in pairs(groups) do
+		-- parameterise every run in the group along the group's shared direction
+		local iv = {}
+		for _, run in ipairs(g.runs) do
+			local s1, s2 = run.a:Dot(g.t), run.b:Dot(g.t)
+			if s1 > s2 then s1, s2 = s2, s1 end
+			iv[#iv + 1] = { s1 = s1, s2 = s2, run = run }
+		end
+		table.sort(iv, function(x, y) return x.s1 < y.s1 end)
+
+		local cur = nil
+		local function flush()
+			if not cur then return end
+			local base = cur.run
+			-- rebuild the endpoints from the unioned interval, keeping the
+			-- perpendicular offset of the run we are extending
+			local origin = base.a - g.t * (base.a:Dot(g.t))
+			base.a = origin + g.t * cur.s1
+			base.b = origin + g.t * cur.s2
+			base.length = cur.s2 - cur.s1
+			others[#others + 1] = base
+			cur = nil
+		end
+
+		for _, e in ipairs(iv) do
+			if cur and e.s1 <= cur.s2 + 1e-3 then
+				if e.s2 > cur.s2 then cur.s2 = e.s2 end
+				removed += 1
+			else
+				flush()
+				cur = { s1 = e.s1, s2 = e.s2, run = e.run }
+			end
+		end
+		flush()
+	end
+
+	result.runs = others
+	result.stats.wallDuplicatesMerged = removed
+	return result
+end
+
+--------------------------------------------------------------------------------
 -- Stitch open ends
 --------------------------------------------------------------------------------
 -- Two partially overlapping grids at different yaw produce boundary chains built
