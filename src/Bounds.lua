@@ -470,9 +470,18 @@ function Bounds.cutOutlines(footData: any, localData: any, result: any, cutBy: a
 					-- entirely — emitting those invents wall along lines no agent
 					-- could ever stand next to.
 					local at = Vector3.new(cell.fc.bottom.X, cell.floorY, cell.fc.bottom.Z)
-					local e = coveringCell(hash, step, at + wdir * step,
-						c.wallDrop, c.wallRise, nil, c.seamPad)
-					if e and cutBy[e.id] and cutBy[e.id][part] then
+					-- The cut set and the floor's dead frontier live in different
+					-- lattices, so the floor cell just outside is not reliably one
+					-- step away. Sweep outward a little rather than sampling a
+					-- single point, or coverage is patchy and everything it misses
+					-- falls back to the jagged floor frame.
+					local e = nil
+					for _, t in ipairs({ 0.6, 1.0, 1.4 }) do
+						local hit = coveringCell(hash, step, at + wdir * (step * t),
+							c.wallDrop, c.wallRise, nil, c.seamPad)
+						if hit and cutBy[hit.id] and cutBy[hit.id][part] then e = hit; break end
+					end
+					if e then
 						covered[e.id .. "|" .. tostring(part)] = true
 						local rowK, crossI
 						if dd.du ~= 0 then rowK = cell.fc.ui; crossI = cell.fc.vi
