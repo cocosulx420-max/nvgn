@@ -492,15 +492,20 @@ function Bounds.cutOutlinesExact(footData: any, localData: any, result: any, cfg
 		end
 		table.sort(items, function(x, y) return x.cross < y.cross end)
 
-		-- Tolerate a small gap in the cross index. The floor lattice and the
-		-- cutter's lattice are not commensurate — at different yaw, consecutive
-		-- floor cells along one wall map to foot cells that occasionally skip an
-		-- index. Requiring strict +1 shattered continuous walls into 1 and 2 stud
-		-- pieces. A real opening is far wider than two cells.
+		-- Strict adjacency. Bridging gaps in the cross index was tried and is not
+		-- safe: allowing a skip of two took total wall length to 2111 studs from
+		-- 1760 one-stud edges — ~350 studs of wall no edge asked for — and the
+		-- longest run reached 259 studs by bridging openings. Sealing a doorway is
+		-- not an acceptable kind of conservative.
+		--
+		-- The fragmentation that tolerance was hiding is real and belongs
+		-- elsewhere: the floor and cutter lattices are not commensurate, so
+		-- consecutive floor edges sometimes skip a foot cell. That is a resampling
+		-- problem, not something to paper over by inventing wall.
 		local i = 1
 		while i <= #items do
 			local j = i
-			while j < #items and items[j + 1].cross - items[j].cross <= 2 do j += 1 end
+			while j < #items and items[j + 1].cross == items[j].cross + 1 do j += 1 end
 			local ca, cb = items[i], items[j]
 			local pa = Vector3.new(ca.fc.bottom.X, ca.floorY, ca.fc.bottom.Z)
 				+ wdir * (step * 0.5) - half * (step * 0.5)
