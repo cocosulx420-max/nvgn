@@ -18,9 +18,14 @@ A baked navmesh generator for Roblox with emergent, physics-driven destruction.
 > The substrate, floor extraction, agent model, and polygon optimization are
 > unchanged and validated.
 >
-> **Revision (boundary extraction).** Four corrections since the first draft of
-> this method, all inside the boundary pipeline:
+> **Revision (boundary extraction).** Corrections since the first draft of this
+> method, all inside the boundary pipeline:
 >
+> - **The substrate is the part-aligned local grid, not a world lattice.** This
+>   is the big one and it was never stated. See
+>   [Substrate for boundaries](#substrate-for-boundaries).
+> - **Wall and dropoff boundaries are different things** and must not be offset
+>   by the same rule. See [Wall vs dropoff](#wall-vs-dropoff).
 > - Contours are traced per **connected component** (step-tolerance adjacency),
 >   not per height layer. Balconies no longer poison the floor below them.
 > - The fit is **inward-biased by construction**. The old offset *budget* did
@@ -87,6 +92,99 @@ A real map with verticality currently bakes in **20-30 minutes**. The test-scene
 
 Floor extraction is embarrassingly parallel (per-cell independent). Parallel Luau across Actors is the obvious lever and is likely a large multiple, not a few percent. Worth doing on its own merits regardless of destruction.
 
+## Substrate for boundaries
+
+> **This was never written down and it is the single most important thing on the
+> page.** The boundary stage does **not** run on a world-axis-aligned lattice of
+> `math.floor(pos.X), math.floor(pos.Z)`. It runs on the **part-aligned local
+> grids**. Building it on a world lattice staircases every surface that is not
+> aligned to world X/Z, and no amount of fitting, tolerance tuning or label
+> smoothing downstream recovers from that — the staircase *is* the input.
+
+Two implemented stages sit between floor extraction and boundary extraction.
+
+### Local grids (`src/LocalGrid.lua` — `NVGN.LocalGrid`)
+
+One grid **per part**, aligned to that part's own top face:
+
+```
+Grid = { part, origin, u, v, n, step, cells, index, dead, deadIndex }
+Cell     = { ui, vi, pos, normal, slope, clearance, cover }
+DeadCell = { ui, vi, pos, killer }
+```
+
+- Cells are indexed `(ui, vi)` in the **part's** frame, so a rotated wall's
+  boundary lands on straight lattice lines instead of a diagonal staircase.
+- Block parts get a true part-aligned grid; non-block parts fall back to the
+  world lattice for now.
+- **Dead cells are the important part.** A sample that would have been floor but
+  was killed is kept *with the instance that killed it*. Clearance is tested
+  with a `GetPartsInPart` probe before any ray, because a raycast never hits a
+  part its origin is inside — so a wall flush on a floor, a buried overlap, or a
+  curved union all defeat ray-only logic. Attribution happens once, at bake
+  time, and is never re-derived later.
+
+Measured on SmallMap (155 parts): 87 grids — **85 part-aligned, 2 world
+fallback** — 50,674 live cells and 18,190 dead cells, in 0.64 s on top of a
+1.6 s floor bake.
+
+### Footprints (`src/Footprint.lua` — `NVGN.Footprint`)
+
+The staircasing fix for wall boundaries, and the reason wall geometry needs no
+line fitting at all:
+
+**A floor's dead-cell frontier is jagged in the floor's lattice, so it is never
+used as geometry.** Instead the part doing the cutting supplies its own clean
+outline — a lattice in the cutting part's yaw frame, sampled by world-vertical
+rays shot **upward from below**. The underside is what cuts floors beneath it,
+and an origin in open air can never hit the inside-origin trap. Boundary
+cell-edges merge into runs that are axis-aligned in that part's own frame, hence
+clean by construction:
+
+```
+Foot    = { part, u, v, origin, step, cells, index, outline }
+Outline = { a, b, outDir }   -- world-space run at underside height
+```
+
+Footprints are built **only for the killer set** — parts that actually killed
+floor cells. Nothing below a part means nothing to cut, and the 200x200 ground
+never needs 40k rays.
+
+**Dead cells only SELECT which portions of an outline apply. They never
+contribute geometry.** That division is the whole trick: attribution comes from
+the floor's frame, geometry comes from the cutter's frame.
+
+## Wall vs dropoff
+
+A boundary is not one thing, and the two kinds must not be offset by the same
+rule.
+
+- A **wall** boundary has something solid behind it. The agent's body cannot
+  occupy that space, so it takes the full inward offset.
+- A **dropoff** boundary — rooftop, ledge, cliff, stair head — has nothing
+  behind it but air. Offsetting it inward is **actively wrong**: it walls the
+  agent off from the very edge it needs to reach in order to drop down. NPCs
+  that are supposed to step off a roof must be able to path to the roof's real
+  edge.
+
+The two are told apart with **zero extra probing**: a boundary cell whose
+outward neighbour is a dead cell is a wall, and the `killer` names the part
+responsible; a boundary cell whose outward neighbour is simply absent is floor
+extent, i.e. a dropoff. This is the attribution the local grid already baked.
+
+Do **not** re-derive this by sampling the SVO for solid at torso height. It was
+tried: the SVO is conservative and inflates every surface by up to one leaf, so
+a probe near the floor lands inside the ledge's own inflated edge voxel and
+reports a blocker that is not there — classifying every raised platform rim as
+wall. The dead-cell killer is exact, free, and already computed.
+
+Consequence for the pipeline: **wall geometry comes from footprint outlines,
+dropoff geometry comes from floor extent**, and the two are never fitted into a
+single segment.
+
+Measured on SmallMap, roughly two thirds of all boundary length is dropoff, not
+wall — a roof has no walls at all — so treating them alike is not an edge case.
+
 ## Boundary extraction
 
 > **This replaces the previous face-projection method.** The old approach took
@@ -118,6 +216,47 @@ Boundary extraction reads `FloorData` and nothing else, so **it does not have to
 
 Keep snapshots of scenes that actually stress the pipeline — a spiral ramp, a balcony over floor, a curved union, an acute corner. A snapshot of the 177-part test scene makes every constant look fine and calibrates none of them.
 
+### Which parts of this pipeline still apply
+
+With local grids and footprints as the substrate, the stages below split into
+three groups. This matters because the first draft implied all of them ran on
+one shared lattice.
+
+| Stage | Status on the local-grid substrate |
+| --- | --- |
+| Component labelling | **Applies**, but adjacency must cross grids — see [Cross-grid stitching](#cross-grid-stitching) |
+| Distance transform | **Applies**, per component, for the narrow-region grading |
+| Contour tracing | **Applies to dropoff edges only** (floor extent, in the floor's own frame) |
+| Greedy line fit | **Not needed for walls.** Footprint outlines are already clean runs. Still needed for dropoff edges and for non-block fallback grids |
+| Inward bias | Applies wherever a fit happens |
+| Offset + miter limit | **Applies to walls only** |
+| Narrow grading | **Applies to walls only** |
+| Severance check | **Applies**, and stays mandatory |
+
+The greedy fit does not disappear — non-block parts (unions, meshes) still fall
+back to a world lattice and still need it, and dropoff edges are traced from
+floor extent rather than supplied by a cutter. But for the common case, an
+axis-aligned block wall, the outline is exact and fitting it would only add
+error.
+
+### Cross-grid stitching
+
+**Open problem, and the one thing this substrate makes harder.** Grids are
+per-part, so a floor assembled from several parts is several grids with
+different `u`/`v` frames. Two consequences:
+
+1. **A shared edge between two adjacent walkable parts is not a boundary.** Each
+   grid's extent ends there, but the floor continues. Tracing extent naively
+   would emit an interior seam as a dropoff, cutting the mesh along every part
+   join.
+2. **Component labelling must span grids**, so adjacency has to be tested in
+   world space (position + step tolerance) rather than by lattice index.
+
+The seam test is the same relation as component adjacency: an extent cell is a
+true dropoff only if no cell of any other grid sits within one step horizontally
+and within the step tolerance vertically. Seam suppression and component
+labelling should therefore be one pass, not two.
+
 ### Pipeline
 
 **1. Label connected components.**
@@ -139,10 +278,12 @@ Use a true EDT, **not** a 4- or 8-neighbour structuring element — those produc
 
 `D` serves three purposes at once: it *is* the thickness map, it *is* the erosion test (`erode by r` == `discard cells where D < r`), and it drives the narrow-region branch below. There is no separate thickness pass.
 
-**3. Trace contours (per component).**
-Trace boundary loops from the **surfel extent** — where the component's cells end. Not from SVO solid voxels (conservative, inflated).
+**3. Trace contours (per component) — dropoff edges only.**
+Trace loops from the **floor extent**: cells at the edge of the component whose outward neighbour is *absent* rather than *dead*, after seam suppression. Not from SVO solid voxels (conservative, inflated).
 
-This uniformly captures both boundary sources: a cell adjacent to a wall, and a cell at a rooftop or cliff edge where the floor just stops. No distinction is needed.
+Wall boundaries do **not** come from here. They are supplied by the footprint outline of the killer named on the adjacent dead cell, already clean in the cutter's own frame.
+
+> The first draft said "this uniformly captures both boundary sources... no distinction is needed." That was wrong twice over: the two sources need different geometry (cutter frame vs floor frame) *and* different offsets (full radius vs none).
 
 **4. Segment into lines (greedy fit).**
 Walk each contour, maintaining a best-fit line through the cells accepted so far:
@@ -203,7 +344,7 @@ Erosion is **asymmetric**:
 
 - **Curved geometry has no straight line to find.** A rounded union wall segments into many short pieces — correct, but poly-heavy. Cap with a minimum segment length plus a near-collinear merge pass. Careful: minimum segment length interacts badly with corner-by-intersection, since once segments get short enough adjacent offset lines barely intersect and corner positions go unstable. The miter limit covers the acute end of this; the near-parallel end needs the collinear merge to fire first.
 - Precision is capped near cell size. Intersecting fitted lines recovers sub-cell corner positions, so the result beats 1 stud, but it is not CFrame-exact. Accepted trade.
-- Boundaries carry no semantic label by construction (wall base vs. ledge vs. mesh edge are all just "boundary"). If a later system needs to know which part blocks a given boundary cell, query the SVO for the adjacent solid leaf and read its **source part ID** — sampling, not interpretation. Boundary cells with no adjacent solid are floor-extent edges (cliffs, ledges, rooftops).
+- ~~Boundaries carry no semantic label by construction.~~ **Superseded.** They do carry a label, and it is load-bearing rather than informational — see [Wall vs dropoff](#wall-vs-dropoff). The label comes from the adjacent dead cell's `killer`, which also names the blocking part directly, so there is no need to query the SVO for an adjacent solid leaf.
 
 ## Polygon optimization
 
@@ -313,6 +454,9 @@ Stated as an interface, so the destruction system can be designed against it:
 
 ## Open items
 
+- **Cross-grid stitching** — seam suppression plus grid-spanning component labelling, as one world-space pass. Prerequisite for everything else on this substrate.
+- **Non-block parts** — unions and meshes still fall back to a world lattice in `LocalGrid`, and `Footprint` skips them entirely. They are the remaining staircase source and the remaining consumer of the greedy fit.
+- **`LocalGrid.lua` and `Footprint.lua` are not in the repo.** They exist only in the Studio place. Back them up; they are now the substrate the whole design rests on.
 - **Component labelling and the inward-bias translation** are the two changes that affect code structure. Land both before tuning any constant.
 - **Profile the 20-30 minute bake.** Urgent on its own terms and a prerequisite for any rebake decision in the destruction section — but it does **not** gate boundary extraction, which iterates against a cached surfel snapshot.
 - **Parallelise floor extraction** across Actors.
