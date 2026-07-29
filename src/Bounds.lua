@@ -241,7 +241,7 @@ function Bounds.classify(localData: any, cfg: Config?)
 					kind = "wall", a = a, b = b, outDir = outDir,
 					cell = cell, grid = g, part = e.part, entryId = e.id,
 					du = d.du, dv = d.dv,
-					killer = dead.killer, comp = e.comp,
+					killer = dead.killer, deadPos = dead.pos, comp = e.comp,
 				}
 				nWall += 1
 			else
@@ -397,6 +397,126 @@ end
 -- is still straight by construction — a ramp's cut line comes out as one clean
 -- segment across its width. For a wall on a floor the cutting set is the whole
 -- silhouette and this reduces to the original outline.
+
+-- Exact version. Every wall edge already names its killer, and the dead cell it
+-- faces has a world position, so the footprint cell responsible is found by a
+-- coordinate lookup — not by probing outward and hoping.
+--
+-- One wall edge -> exactly one footprint boundary segment, in the cutter's frame.
+-- No sweeps, no duplicates, no misses, and no dedupe pass needed: a stretch is
+-- emitted once because exactly one set of edges maps to it.
+function Bounds.cutOutlinesExact(footData: any, localData: any, result: any, cfg: Config?)
+	local c = merged(cfg)
+	local step = localData.config.step
+
+	-- foot cells, hashed by world XZ, per killer
+	local footHash = {}
+	for part, foot in pairs(footData.foots) do
+		local h = {}
+		for _, fc in ipairs(foot.cells) do
+			local k = key(math.floor(fc.bottom.X / step), math.floor(fc.bottom.Z / step))
+			local b = h[k]
+			if not b then b = {}; h[k] = b end
+			b[#b + 1] = fc
+		end
+		footHash[part] = h
+	end
+
+	local dirs = {
+		{ du = 1, dv = 0 }, { du = -1, dv = 0 },
+		{ du = 0, dv = 1 }, { du = 0, dv = -1 },
+	}
+
+	-- (part, dir, row) -> list of {cross, footCell, floorY}
+	local buckets, nMapped, nUnmapped = {}, 0, 0
+	local mapped = {}
+
+	for _, e in ipairs(result.edges) do
+		if e.kind ~= "wall" or not e.killer or not e.deadPos then continue end
+		local foot = footData.foots[e.killer]
+		if not foot then continue end
+
+		-- the footprint cell covering the dead sample
+		local h = footHash[e.killer]
+		local bx, bz = math.floor(e.deadPos.X / step), math.floor(e.deadPos.Z / step)
+		local best, bestD = nil, math.huge
+		for ox = -1, 1 do
+			for oz = -1, 1 do
+				local b = h[key(bx + ox, bz + oz)]
+				if b then
+					for _, fc in ipairs(b) do
+						local dx = fc.bottom.X - e.deadPos.X
+						local dz = fc.bottom.Z - e.deadPos.Z
+						local d2 = dx * dx + dz * dz
+						if d2 < bestD then bestD = d2; best = fc end
+					end
+				end
+			end
+		end
+		if not best or bestD > (step * 1.1) ^ 2 then
+			nUnmapped += 1
+			continue
+		end
+
+		-- the outline faces back the way the wall edge came from
+		local want = -e.outDir
+		local bd, bdot = nil, -math.huge
+		for _, dd in ipairs(dirs) do
+			local wdir = foot.u * dd.du + foot.v * dd.dv
+			local dot = wdir:Dot(want)
+			if dot > bdot then bdot = dot; bd = dd end
+		end
+
+		local row, cross
+		if bd.du ~= 0 then row, cross = best.ui, best.vi else row, cross = best.vi, best.ui end
+		local bk = ("%s|%d|%d|%d"):format(tostring(e.killer), bd.du, bd.dv, row)
+		local bucket = buckets[bk]
+		if not bucket then
+			bucket = { part = e.killer, foot = foot, dd = bd, items = {} }
+			buckets[bk] = bucket
+		end
+		bucket.items[#bucket.items + 1] = { cross = cross, fc = best, floorY = e.cell.pos.Y, comp = e.comp }
+		mapped[e] = true
+		nMapped += 1
+	end
+
+	-- collapse each row into runs
+	local out = {}
+	for _, bucket in pairs(buckets) do
+		local foot, dd = bucket.foot, bucket.dd
+		local wdir = foot.u * dd.du + foot.v * dd.dv
+		local half = (dd.du ~= 0) and foot.v or foot.u
+		local seen, items = {}, {}
+		for _, it in ipairs(bucket.items) do
+			if not seen[it.cross] then seen[it.cross] = true; items[#items + 1] = it end
+		end
+		table.sort(items, function(x, y) return x.cross < y.cross end)
+
+		local i = 1
+		while i <= #items do
+			local j = i
+			while j < #items and items[j + 1].cross == items[j].cross + 1 do j += 1 end
+			local ca, cb = items[i], items[j]
+			local pa = Vector3.new(ca.fc.bottom.X, ca.floorY, ca.fc.bottom.Z)
+				+ wdir * (step * 0.5) - half * (step * 0.5)
+			local pb = Vector3.new(cb.fc.bottom.X, cb.floorY, cb.fc.bottom.Z)
+				+ wdir * (step * 0.5) + half * (step * 0.5)
+			out[#out + 1] = {
+				kind = "wall", source = "footprint",
+				a = pa, b = pb, outDir = wdir,
+				part = bucket.part, killer = bucket.part,
+				comp = ca.comp,
+				length = (pb - pa).Magnitude,
+			}
+			i = j + 1
+		end
+	end
+
+	result.stats.edgesMapped = nMapped
+	result.stats.edgesUnmapped = nUnmapped
+	result.stats.cutOutlineRuns = #out
+	return out, mapped
+end
 
 function Bounds.cutOutlines(footData: any, localData: any, result: any, cutBy: any, cfg: Config?)
 	local c = merged(cfg)
@@ -563,7 +683,7 @@ function Bounds.wallGeometry(result: any, footData: any, localData: any, cfg: Co
 	-- cells that genuinely close to within minClearance of the floor, traced in
 	-- the cutter's lattice. Straight by construction, and correct for tilted and
 	-- raised parts where the silhouette is not the cut line.
-	local out, covered = Bounds.cutOutlines(footData, localData, result, cutBy, c)
+	local out, mapped = Bounds.cutOutlinesExact(footData, localData, result, c)
 	local nSpans = #out
 
 	-- A wall edge falls back ONLY when its killer has no footprint at all.
@@ -579,12 +699,14 @@ function Bounds.wallGeometry(result: any, footData: any, localData: any, cfg: Co
 	-- to kill the cell in the first place, so if a killer has a footprint, its
 	-- cut contour is by construction the geometry for every edge it caused.
 	-- Whether a probe happened to land is irrelevant.
+	-- An edge falls back when it was not mapped onto a footprint: no killer, no
+	-- footprint for that killer, or a dead sample that landed outside the
+	-- footprint lattice. Keyed off the actual mapping rather than a guess about
+	-- which edges the mapping should have caught.
 	local leftover, dropoffEdges = {}, {}
 	for _, e in ipairs(result.edges) do
 		if e.kind == "wall" then
-			if not (e.killer and footData.foots[e.killer]) then
-				leftover[#leftover + 1] = e
-			end
+			if not mapped[e] then leftover[#leftover + 1] = e end
 		else
 			dropoffEdges[#dropoffEdges + 1] = e
 		end
