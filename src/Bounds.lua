@@ -382,6 +382,133 @@ function Bounds.mergeRuns(result: any)
 end
 
 --------------------------------------------------------------------------------
+-- Cut outlines: where a killer actually cuts, in the killer's own frame
+--------------------------------------------------------------------------------
+-- Footprint gives a part's SILHOUETTE outline. That is the true cut line only
+-- when the part's underside sits on the floor, as a wall does. It is wrong for
+-- anything tilted or raised: a ramp 15x1x30 whose underside spans Y 0.30 to
+-- 10.30 only kills floor where its underside closes to within minClearance, so
+-- the frontier is a clearance CONTOUR running across the silhouette, nowhere
+-- near its edge. Matching floor edges against the silhouette then fails and
+-- everything falls back to the jagged floor lattice.
+--
+-- So select, in the cutter's own lattice, the footprint cells that actually cut,
+-- and trace the boundary of THAT set. Same row-collapse as before, so the result
+-- is still straight by construction — a ramp's cut line comes out as one clean
+-- segment across its width. For a wall on a floor the cutting set is the whole
+-- silhouette and this reduces to the original outline.
+
+function Bounds.cutOutlines(footData: any, localData: any, result: any, cfg: Config?)
+	local c = merged(cfg)
+	local step = localData.config.step
+	local minClear = localData.config.minClearance or 1.5
+	local hash = result.hash
+
+	-- floor height under a point: consider live cells AND dead ones, since a dead
+	-- cell is still floor, just floor this part killed
+	local floorHash = {}
+	local function addFloor(pos: Vector3, entry: any)
+		local k = key(math.floor(pos.X / step), math.floor(pos.Z / step))
+		local b = floorHash[k]
+		if not b then b = {}; floorHash[k] = b end
+		b[#b + 1] = { pos = pos, entry = entry }
+	end
+	for _, e in ipairs(result.entries) do addFloor(e.cell.pos, e) end
+	for _, g in pairs(localData.grids) do
+		for _, d in ipairs(g.dead) do addFloor(d.pos, nil) end
+	end
+
+	local function floorUnder(p: Vector3)
+		local bx, bz = math.floor(p.X / step), math.floor(p.Z / step)
+		local bestY, best = nil, nil
+		for ox = -1, 1 do
+			for oz = -1, 1 do
+				local b = floorHash[key(bx + ox, bz + oz)]
+				if b then
+					for _, f in ipairs(b) do
+						if math.abs(f.pos.X - p.X) <= step * 0.5 + c.seamPad
+							and math.abs(f.pos.Z - p.Z) <= step * 0.5 + c.seamPad
+							and f.pos.Y <= p.Y + 0.1 then
+							if bestY == nil or f.pos.Y > bestY then bestY = f.pos.Y; best = f end
+						end
+					end
+				end
+			end
+		end
+		return bestY, best
+	end
+
+	local dirs = {
+		{ du = 1, dv = 0 }, { du = -1, dv = 0 },
+		{ du = 0, dv = 1 }, { du = 0, dv = -1 },
+	}
+
+	local outlines, covered = {}, {}
+	local nCut, nRuns = 0, 0
+
+	for part, foot in pairs(footData.foots) do
+		-- 1. which footprint cells actually cut the floor beneath them
+		local cutting = {}
+		for _, fc in ipairs(foot.cells) do
+			local fy = floorUnder(fc.bottom)
+			if fy and (fc.bottom.Y - fy) < minClear then
+				cutting[key(fc.ui, fc.vi)] = { fc = fc, floorY = fy }
+				nCut += 1
+			end
+		end
+
+		-- 2. trace the boundary of the cutting set, in this part's lattice
+		for _, dd in ipairs(dirs) do
+			local wdir = foot.u * dd.du + foot.v * dd.dv
+			local half = (dd.du ~= 0) and foot.v or foot.u
+			local rows = {}
+			for k, cell in pairs(cutting) do
+				if not cutting[key(cell.fc.ui + dd.du, cell.fc.vi + dd.dv)] then
+					local rowK, crossI
+					if dd.du ~= 0 then rowK = cell.fc.ui; crossI = cell.fc.vi
+					else rowK = cell.fc.vi; crossI = cell.fc.ui end
+					local lst = rows[rowK]
+					if not lst then lst = {}; rows[rowK] = lst end
+					lst[#lst + 1] = { cross = crossI, cell = cell }
+
+					-- mark the floor cell just outside as covered by this killer
+					local at = Vector3.new(cell.fc.bottom.X, cell.floorY, cell.fc.bottom.Z)
+					local e = coveringCell(hash, step, at + wdir * step,
+						c.wallDrop, c.wallRise, nil, c.seamPad)
+					if e then covered[e.id .. "|" .. tostring(part)] = true end
+				end
+			end
+
+			for _, lst in pairs(rows) do
+				table.sort(lst, function(x, y) return x.cross < y.cross end)
+				local i = 1
+				while i <= #lst do
+					local j = i
+					while j < #lst and lst[j + 1].cross == lst[j].cross + 1 do j += 1 end
+					local ca, cb = lst[i].cell, lst[j].cell
+					local pa = Vector3.new(ca.fc.bottom.X, ca.floorY, ca.fc.bottom.Z)
+						+ wdir * (step * 0.5) - half * (step * 0.5)
+					local pb = Vector3.new(cb.fc.bottom.X, cb.floorY, cb.fc.bottom.Z)
+						+ wdir * (step * 0.5) + half * (step * 0.5)
+					outlines[#outlines + 1] = {
+						kind = "wall", source = "footprint",
+						a = pa, b = pb, outDir = wdir,
+						part = part, killer = part,
+						length = (pb - pa).Magnitude,
+					}
+					nRuns += 1
+					i = j + 1
+				end
+			end
+		end
+	end
+
+	result.stats.cutCells = nCut
+	result.stats.cutOutlineRuns = nRuns
+	return outlines, covered
+end
+
+--------------------------------------------------------------------------------
 -- Wall geometry from footprint outlines
 --------------------------------------------------------------------------------
 -- A floor's dead-cell frontier is jagged in the FLOOR's lattice, so it is never
@@ -398,78 +525,15 @@ end
 -- keep their floor-frame runs. Dropping them would open a route that does not
 -- exist, which is the one error this pipeline must never make.
 
-function Bounds.wallGeometry(result: any, footData: any, cfg: Config?)
+function Bounds.wallGeometry(result: any, footData: any, localData: any, cfg: Config?)
 	local c = merged(cfg)
-	local step = result.config and result.config.step or 1
-	local hash = result.hash
 
-	-- which killers actually cut each live cell
-	local cutBy: { [number]: { [Instance]: boolean } } = {}
-	for _, e in ipairs(result.edges) do
-		if e.kind == "wall" and e.killer and e.entryId then
-			local s = cutBy[e.entryId]
-			if not s then s = {}; cutBy[e.entryId] = s end
-			s[e.killer] = true
-		end
-	end
-
-	local out, covered = {}, {}
-	local nSpans, nSamples, nMatched = 0, 0, 0
-
-	for part, foot in pairs(footData.foots) do
-		for _, o in ipairs(foot.outline) do
-			local d = o.b - o.a
-			local len = d.Magnitude
-			if len < 1e-3 then continue end
-			local dir = d / len
-			local n = math.max(1, math.floor(len / step + 0.5))
-
-			-- sample the outline; a sample is active where it borders live floor
-			-- that this very part cut
-			local hit = table.create(n)
-			for i = 0, n - 1 do
-				local p = o.a + dir * ((i + 0.5) * step)
-				local probe = p + o.outDir * (step * 0.5)
-				nSamples += 1
-				local e = coveringCell(hash, step, probe, c.wallDrop, c.wallRise, nil, c.seamPad)
-				if e and cutBy[e.id] and cutBy[e.id][part] then
-					hit[i] = e
-					nMatched += 1
-					-- coverage is per (cell, killer): a cell cut by two parts is
-					-- only covered for the one whose outline actually matched
-					covered[e.id .. "|" .. tostring(part)] = true
-				else
-					hit[i] = false
-				end
-			end
-
-			-- merge consecutive active samples into spans
-			local i = 0
-			while i < n do
-				if not hit[i] then i += 1; continue end
-				local j = i
-				while j + 1 < n and hit[j + 1] do j += 1 end
-
-				-- XZ from the outline (clean, cutter frame); Y from the floor the
-				-- span borders, so ramps and stairs are followed
-				local pa = o.a + dir * (i * step)
-				local pb = o.a + dir * ((j + 1) * step)
-				local ya = hit[i].cell.pos.Y
-				local yb = hit[j].cell.pos.Y
-				out[#out + 1] = {
-					kind = "wall", source = "footprint",
-					a = Vector3.new(pa.X, ya, pa.Z),
-					b = Vector3.new(pb.X, yb, pb.Z),
-					outDir = o.outDir,
-					part = part, killer = part,
-					comp = hit[i].comp,
-					length = (pb - pa).Magnitude,
-				}
-				nSpans += 1
-				i = j + 1
-			end
-		end
-	end
+	-- Geometry comes from the cut outlines: the boundary of the set of footprint
+	-- cells that genuinely close to within minClearance of the floor, traced in
+	-- the cutter's lattice. Straight by construction, and correct for tilted and
+	-- raised parts where the silhouette is not the cut line.
+	local out, covered = Bounds.cutOutlines(footData, localData, result, c)
+	local nSpans = #out
 
 	-- Every wall edge not covered by a footprint span keeps its floor-frame
 	-- geometry: non-block killers, and anything the outline sampling missed.
@@ -500,8 +564,6 @@ function Bounds.wallGeometry(result: any, footData: any, cfg: Config?)
 	result.stats.wallFromFloorFrame = #fallback
 	result.stats.wallFootprintLength = fpLen
 	result.stats.wallFallbackLength = fbLen
-	result.stats.outlineSamples = nSamples
-	result.stats.outlineMatched = nMatched
 	return result
 end
 
