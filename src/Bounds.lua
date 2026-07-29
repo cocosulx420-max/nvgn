@@ -27,6 +27,12 @@ export type Config = {
 local DEFAULT = {
 	stepTol = 2.0,
 	seamSlack = 0.35,
+	-- Vertical window when matching an outline sample to the floor it borders.
+	-- Asymmetric on purpose: a wall standing ON a floor has its underside at the
+	-- floor height, while an overhang that killed cells by CLEARANCE sits above
+	-- the floor by up to minClearance. So look mostly downward.
+	wallDrop = 3.0,
+	wallRise = 1.0,
 }
 
 local function merged(cfg: Config?)
@@ -101,6 +107,29 @@ local function cellNear(hash: any, step: number, p: Vector3, stepTol: number, sl
 		end
 	end
 	return nil
+end
+
+-- As above, but with an asymmetric vertical window, for matching a footprint
+-- outline sample against the floor it borders.
+local function cellNearY(hash: any, step: number, p: Vector3, down: number, up: number, slack: number): any
+	local bx, bz = math.floor(p.X / step), math.floor(p.Z / step)
+	local best, bestDy = nil, math.huge
+	for ox = -1, 1 do
+		for oz = -1, 1 do
+			local b = hash[key(bx + ox, bz + oz)]
+			if b then
+				for _, e in ipairs(b) do
+					local d = e.cell.pos - p
+					if math.abs(d.X) <= slack and math.abs(d.Z) <= slack
+						and d.Y <= up and d.Y >= -down then
+						local ady = math.abs(d.Y)
+						if ady < bestDy then bestDy = ady; best = e end
+					end
+				end
+			end
+		end
+	end
+	return best
 end
 
 --------------------------------------------------------------------------------
@@ -191,7 +220,7 @@ function Bounds.classify(localData: any, cfg: Config?)
 				-- 2. the neighbour sample was killed -> a wall, and we know by what
 				edges[#edges + 1] = {
 					kind = "wall", a = a, b = b, outDir = outDir,
-					cell = cell, grid = g, part = e.part,
+					cell = cell, grid = g, part = e.part, entryId = e.id,
 					du = d.du, dv = d.dv,
 					killer = dead.killer, comp = e.comp,
 				}
@@ -329,6 +358,134 @@ function Bounds.mergeRuns(result: any)
 end
 
 --------------------------------------------------------------------------------
+-- Wall geometry from footprint outlines
+--------------------------------------------------------------------------------
+-- A floor's dead-cell frontier is jagged in the FLOOR's lattice, so it is never
+-- used as geometry. The part that did the cutting supplies the line instead,
+-- already clean in its own yaw frame. Dead cells only SELECT which span of that
+-- outline actually borders walkable floor.
+--
+-- Verticality: outline endpoints ride the killer's underside, which follows a
+-- tilted part down its incline, so a ramp's outline is already sloped. The Y we
+-- emit is taken from the floor cell each sample matched, not from the outline,
+-- so a wall bordering a ramp tracks the ramp rather than sitting at one height.
+--
+-- Killers with no footprint (unions, meshes — Footprint.build skips non-blocks)
+-- keep their floor-frame runs. Dropping them would open a route that does not
+-- exist, which is the one error this pipeline must never make.
+
+function Bounds.wallGeometry(result: any, footData: any, cfg: Config?)
+	local c = merged(cfg)
+	local step = result.config and result.config.step or 1
+	local hash = result.hash
+
+	-- which killers actually cut each live cell
+	local cutBy: { [number]: { [Instance]: boolean } } = {}
+	for _, e in ipairs(result.edges) do
+		if e.kind == "wall" and e.killer and e.entryId then
+			local s = cutBy[e.entryId]
+			if not s then s = {}; cutBy[e.entryId] = s end
+			s[e.killer] = true
+		end
+	end
+
+	local out, covered = {}, {}
+	local nSpans, nSamples, nMatched = 0, 0, 0
+
+	for part, foot in pairs(footData.foots) do
+		for _, o in ipairs(foot.outline) do
+			local d = o.b - o.a
+			local len = d.Magnitude
+			if len < 1e-3 then continue end
+			local dir = d / len
+			local n = math.max(1, math.floor(len / step + 0.5))
+
+			-- sample the outline; a sample is active where it borders live floor
+			-- that this very part cut
+			local hit = table.create(n)
+			for i = 0, n - 1 do
+				local p = o.a + dir * ((i + 0.5) * step)
+				local probe = p + o.outDir * (step * 0.5)
+				nSamples += 1
+				local e = cellNearY(hash, step, probe, c.wallDrop, c.wallRise, step * 0.75)
+				if e and cutBy[e.id] and cutBy[e.id][part] then
+					hit[i] = e
+					nMatched += 1
+					covered[e.id] = true
+				else
+					hit[i] = false
+				end
+			end
+
+			-- merge consecutive active samples into spans
+			local i = 0
+			while i < n do
+				if not hit[i] then i += 1; continue end
+				local j = i
+				while j + 1 < n and hit[j + 1] do j += 1 end
+
+				-- XZ from the outline (clean, cutter frame); Y from the floor the
+				-- span borders, so ramps and stairs are followed
+				local pa = o.a + dir * (i * step)
+				local pb = o.a + dir * ((j + 1) * step)
+				local ya = hit[i].cell.pos.Y
+				local yb = hit[j].cell.pos.Y
+				out[#out + 1] = {
+					kind = "wall", source = "footprint",
+					a = Vector3.new(pa.X, ya, pa.Z),
+					b = Vector3.new(pb.X, yb, pb.Z),
+					outDir = o.outDir,
+					part = part, killer = part,
+					comp = hit[i].comp,
+					length = (pb - pa).Magnitude,
+				}
+				nSpans += 1
+				i = j + 1
+			end
+		end
+	end
+
+	-- Any wall edge whose cell no footprint span covered keeps the floor-frame
+	-- run: non-block killers, and anything the outline sampling missed.
+	local fallback = {}
+	for _, run in ipairs(result.runs) do
+		if run.kind == "wall" then
+			local keep = false
+			if not footData.foots[run.killer] then
+				keep = true
+			end
+			if keep then
+				run.source = "floor-frame"
+				fallback[#fallback + 1] = run
+			end
+		end
+	end
+
+	local wallRuns = {}
+	for _, r in ipairs(out) do wallRuns[#wallRuns + 1] = r end
+	for _, r in ipairs(fallback) do wallRuns[#wallRuns + 1] = r end
+
+	local newRuns = {}
+	for _, r in ipairs(result.runs) do
+		if r.kind ~= "wall" then newRuns[#newRuns + 1] = r end
+	end
+	for _, r in ipairs(wallRuns) do newRuns[#newRuns + 1] = r end
+	result.runs = newRuns
+
+	local fpLen, fbLen = 0, 0
+	for _, r in ipairs(out) do fpLen += r.length end
+	for _, r in ipairs(fallback) do fbLen += r.length end
+
+	result.stats.wallFromFootprint = #out
+	result.stats.wallFromFloorFrame = #fallback
+	result.stats.wallFootprintLength = fpLen
+	result.stats.wallFallbackLength = fbLen
+	result.stats.outlineSamples = nSamples
+	result.stats.outlineMatched = nMatched
+	return result
+end
+
+--------------------------------------------------------------------------------
 -- Debug draw
 --------------------------------------------------------------------------------
 
@@ -342,7 +499,8 @@ function Bounds.visualize(result: any, parent: Instance?)
 	local fW = Instance.new("Folder"); fW.Name = "Wall"; fW.Parent = folder
 	local fD = Instance.new("Folder"); fD.Name = "Dropoff"; fD.Parent = folder
 
-	local WALL = Color3.fromRGB(70, 170, 255)
+	local WALL = Color3.fromRGB(70, 170, 255)      -- wall, from a footprint outline
+	local WALL_FB = Color3.fromRGB(255, 150, 40)   -- wall, floor-frame fallback
 	local DROP = Color3.fromRGB(120, 255, 130)
 
 	-- draw merged runs when they exist, raw cell edges otherwise
@@ -354,7 +512,13 @@ function Bounds.visualize(result: any, parent: Instance?)
 			local bar = Instance.new("Part")
 			bar.Anchored = true; bar.CanCollide = false; bar.CanQuery = false; bar.CanTouch = false
 			bar.Size = Vector3.new(len, 0.14, 0.14)
-			bar.Color = (e.kind == "wall") and WALL or DROP
+			if e.kind ~= "wall" then
+				bar.Color = DROP
+			elseif e.source == "floor-frame" then
+				bar.Color = WALL_FB
+			else
+				bar.Color = WALL
+			end
 			bar.Material = Enum.Material.Neon
 			bar.CFrame = CFrame.fromMatrix((e.a + e.b) * 0.5 + Vector3.new(0, 0.25, 0),
 				d / len, Vector3.yAxis)
