@@ -469,7 +469,13 @@ function Bounds.cutOutlinesExact(footData: any, localData: any, result: any, cfg
 
 		local row, cross
 		if bd.du ~= 0 then row, cross = best.ui, best.vi else row, cross = best.vi, best.ui end
-		local bk = ("%s|%d|%d|%d"):format(tostring(e.killer), bd.du, bd.dv, row)
+		-- The footprint lattice is 2D, but one XZ column can cut floors at several
+		-- heights: a tall wall cuts the ground AND a balcony above it, and both map
+		-- to the same foot cell. Without the level in the key those edges share a
+		-- bucket, and a run then stretches from one level to the other — that is
+		-- what produced 251-stud walls and 2091 studs of wall from 1895 edges.
+		local level = math.floor(e.cell.pos.Y * 2 + 0.5)
+		local bk = ("%s|%d|%d|%d|%d"):format(tostring(e.killer), bd.du, bd.dv, row, level)
 		local bucket = buckets[bk]
 		if not bucket then
 			bucket = { part = e.killer, foot = foot, dd = bd, items = {} }
