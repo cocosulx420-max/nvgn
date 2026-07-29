@@ -398,6 +398,199 @@ end
 -- segment across its width. For a wall on a floor the cutting set is the whole
 -- silhouette and this reduces to the original outline.
 
+-- Row-snapped version.
+--
+-- Mapping each floor edge to its NEAREST foot cell is not enough. Where a wall
+-- lies between two rows of the cutter's lattice, consecutive floor edges land
+-- alternately on row r and row r+1, so one straight wall came out as two
+-- parallel lines a stud apart, each broken into fragments — the zigzag with
+-- missing segments.
+--
+-- A wall is one row of the cut boundary. So compute the cut-set boundary first,
+-- and snap each edge to a BOUNDARY cell rather than any cell. Every edge along a
+-- given wall then lands on the same row, the line is straight by construction,
+-- and the edges only decide how far along that row the wall extends.
+function Bounds.wallRuns(footData: any, localData: any, result: any, cfg: Config?)
+	local c = merged(cfg)
+	local step = localData.config.step
+	local minClear = localData.config.minClearance or 1.5
+
+	-- floor height under a point, from live cells and dead ones alike
+	local floorHash = {}
+	local function addFloor(pos: Vector3)
+		local k = key(math.floor(pos.X / step), math.floor(pos.Z / step))
+		local b = floorHash[k]
+		if not b then b = {}; floorHash[k] = b end
+		b[#b + 1] = pos
+	end
+	for _, e in ipairs(result.entries) do addFloor(e.cell.pos) end
+	for _, g in pairs(localData.grids) do
+		for _, d in ipairs(g.dead) do addFloor(d.pos) end
+	end
+	local function floorUnder(p: Vector3): number?
+		local bx, bz = math.floor(p.X / step), math.floor(p.Z / step)
+		local bestY = nil
+		for ox = -1, 1 do
+			for oz = -1, 1 do
+				local b = floorHash[key(bx + ox, bz + oz)]
+				if b then
+					for _, q in ipairs(b) do
+						if math.abs(q.X - p.X) <= step * 0.5 + c.seamPad
+							and math.abs(q.Z - p.Z) <= step * 0.5 + c.seamPad
+							and q.Y <= p.Y + 0.1 then
+							if bestY == nil or q.Y > bestY then bestY = q.Y end
+						end
+					end
+				end
+			end
+		end
+		return bestY
+	end
+
+	local dirs = {
+		{ du = 1, dv = 0 }, { du = -1, dv = 0 },
+		{ du = 0, dv = 1 }, { du = 0, dv = -1 },
+	}
+
+	-- per killer: cut-set boundary cells, indexed by direction and row
+	local info = {}
+	for part, foot in pairs(footData.foots) do
+		local cutting, byIdx = {}, {}
+		for _, fc in ipairs(foot.cells) do
+			local fy = floorUnder(fc.bottom)
+			if fy and (fc.bottom.Y - fy) < minClear then
+				local k = key(fc.ui, fc.vi)
+				cutting[k] = { fc = fc, floorY = fy }
+				byIdx[k] = cutting[k]
+			end
+		end
+
+		local rows, flat = {}, {}
+		for _, dirIdx in ipairs({ 1, 2, 3, 4 }) do
+			local dd = dirs[dirIdx]
+			for _, cell in pairs(cutting) do
+				if not byIdx[key(cell.fc.ui + dd.du, cell.fc.vi + dd.dv)] then
+					local row, cross
+					if dd.du ~= 0 then row, cross = cell.fc.ui, cell.fc.vi
+					else row, cross = cell.fc.vi, cell.fc.ui end
+					local rk = ("%d|%d"):format(dirIdx, row)
+					local rr = rows[rk]
+					if not rr then rr = { dirIdx = dirIdx, row = row, cells = {} }; rows[rk] = rr end
+					rr.cells[cross] = cell
+					flat[#flat + 1] = {
+						dirIdx = dirIdx, row = row, cross = cross,
+						cell = cell, rk = rk,
+					}
+				end
+			end
+		end
+
+		-- spatial hash of boundary cells for nearest lookup
+		local bh = {}
+		for _, b in ipairs(flat) do
+			local k = key(math.floor(b.cell.fc.bottom.X / step), math.floor(b.cell.fc.bottom.Z / step))
+			local lst = bh[k]
+			if not lst then lst = {}; bh[k] = lst end
+			lst[#lst + 1] = b
+		end
+
+		info[part] = { foot = foot, rows = rows, hash = bh }
+	end
+
+	-- attribute each wall edge to a boundary cell of its own killer
+	local backed, mapped, nMapped, nUnmapped = {}, {}, 0, 0
+	for _, e in ipairs(result.edges) do
+		if e.kind ~= "wall" or not e.killer or not e.deadPos then continue end
+		local inf = info[e.killer]
+		if not inf then continue end
+
+		-- which of the four faces points back the way the edge came from
+		local want = -e.outDir
+		local bestIdx, bestDot = nil, -math.huge
+		for i, dd in ipairs(dirs) do
+			local wdir = inf.foot.u * dd.du + inf.foot.v * dd.dv
+			local dot = wdir:Dot(want)
+			if dot > bestDot then bestDot = dot; bestIdx = i end
+		end
+
+		local bx = math.floor(e.deadPos.X / step)
+		local bz = math.floor(e.deadPos.Z / step)
+		local best, bestD = nil, math.huge
+		for ox = -1, 1 do
+			for oz = -1, 1 do
+				local lst = inf.hash[key(bx + ox, bz + oz)]
+				if lst then
+					for _, b in ipairs(lst) do
+						if b.dirIdx == bestIdx then
+							local dx = b.cell.fc.bottom.X - e.deadPos.X
+							local dz = b.cell.fc.bottom.Z - e.deadPos.Z
+							local d2 = dx * dx + dz * dz
+							if d2 < bestD then bestD = d2; best = b end
+						end
+					end
+				end
+			end
+		end
+		if not best or bestD > (step * 1.6) ^ 2 then
+			nUnmapped += 1
+			continue
+		end
+
+		local slot = backed[e.killer]
+		if not slot then slot = {}; backed[e.killer] = slot end
+		local rowSlot = slot[best.rk]
+		if not rowSlot then rowSlot = { crosses = {}, comp = e.comp }; slot[best.rk] = rowSlot end
+		rowSlot.crosses[best.cross] = true
+		mapped[e] = true
+		nMapped += 1
+	end
+
+	-- emit one straight segment per contiguous backed stretch of a row
+	local out = {}
+	for part, slot in pairs(backed) do
+		local inf = info[part]
+		for rk, rowSlot in pairs(slot) do
+			local rr = inf.rows[rk]
+			if not rr then continue end
+			local dd = dirs[rr.dirIdx]
+			local wdir = inf.foot.u * dd.du + inf.foot.v * dd.dv
+			local half = (dd.du ~= 0) and inf.foot.v or inf.foot.u
+
+			local list = {}
+			for cross in pairs(rowSlot.crosses) do list[#list + 1] = cross end
+			table.sort(list)
+
+			local i = 1
+			while i <= #list do
+				local j = i
+				-- a hiccup of one cell is lattice mismatch; a real opening is wider
+				while j < #list and list[j + 1] - list[j] <= 2 do j += 1 end
+				local ca = rr.cells[list[i]]
+				local cb = rr.cells[list[j]]
+				if ca and cb then
+					local pa = Vector3.new(ca.fc.bottom.X, ca.floorY, ca.fc.bottom.Z)
+						+ wdir * (step * 0.5) - half * (step * 0.5)
+					local pb = Vector3.new(cb.fc.bottom.X, cb.floorY, cb.fc.bottom.Z)
+						+ wdir * (step * 0.5) + half * (step * 0.5)
+					out[#out + 1] = {
+						kind = "wall", source = "footprint",
+						a = pa, b = pb, outDir = wdir,
+						part = part, killer = part, comp = rowSlot.comp,
+						cells = j - i + 1,
+						length = (pb - pa).Magnitude,
+					}
+				end
+				i = j + 1
+			end
+		end
+	end
+
+	result.stats.edgesMapped = nMapped
+	result.stats.edgesUnmapped = nUnmapped
+	result.stats.cutOutlineRuns = #out
+	return out, mapped
+end
+
 -- Exact version. Every wall edge already names its killer, and the dead cell it
 -- faces has a world position, so the footprint cell responsible is found by a
 -- coordinate lookup — not by probing outward and hoping.
@@ -711,7 +904,7 @@ function Bounds.wallGeometry(result: any, footData: any, localData: any, cfg: Co
 	-- cells that genuinely close to within minClearance of the floor, traced in
 	-- the cutter's lattice. Straight by construction, and correct for tilted and
 	-- raised parts where the silhouette is not the cut line.
-	local out, mapped = Bounds.cutOutlinesExact(footData, localData, result, c)
+	local out, mapped = Bounds.wallRuns(footData, localData, result, c)
 	local nSpans = #out
 
 	-- A wall edge falls back ONLY when its killer has no footprint at all.
