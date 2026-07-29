@@ -354,31 +354,49 @@ function Boundary2.fitSegments(pts: { any }, cfg: Config?)
 		end
 	end
 
-	-- orient each line's normal inward, then bias the line inward until it never
-	-- sits outward of an accepted cell centre. This is what makes the clearance
-	-- guarantee exact instead of budgeted: the true surface is at least
-	-- CELL_HALF outward of every centre, so a line at or inward of every centre
-	-- is at least CELL_HALF inward of the surface before the offset is applied.
 	for _, s in ipairs(segs) do
-		if s.line then
-			local ax, az = 0, 0
-			for _, p in ipairs(s.pts) do ax += p.inx; az += p.inz end
-			if s.line.nx * ax + s.line.nz * az < 0 then
-				s.line.nx = -s.line.nx
-				s.line.nz = -s.line.nz
-			end
-			local maxT = 0
-			for _, p in ipairs(s.pts) do
-				local t = (p.x - s.line.cx) * s.line.nx + (p.z - s.line.cz) * s.line.nz
-				if t > maxT then maxT = t end
-			end
-			s.bias = maxT
-			s.line.cx += s.line.nx * maxT
-			s.line.cz += s.line.nz * maxT
-		end
+		if s.line then Boundary2.orientInward(s) end
 	end
-
 	return segs
+end
+
+-- Point the line's normal at the walkable interior.
+function Boundary2.orientInward(s: any)
+	local ax, az = 0, 0
+	for _, p in ipairs(s.pts) do ax += p.inx; az += p.inz end
+	if s.line.nx * ax + s.line.nz * az < 0 then
+		s.line.nx = -s.line.nx
+		s.line.nz = -s.line.nz
+	end
+end
+
+-- Translate the line inward until it never sits outward of an accepted cell
+-- centre. This is what makes the clearance guarantee exact instead of budgeted:
+-- the true surface is at least CELL_HALF outward of every centre, so a line at
+-- or inward of every centre is already at least CELL_HALF inward of the surface
+-- before the agent-radius offset is applied on top.
+--
+-- Applied once, after merging — biasing a line and then re-biasing a merged
+-- version of it would shift the boundary inward twice.
+function Boundary2.biasInward(s: any)
+	local maxT = 0
+	for _, p in ipairs(s.pts) do
+		local t = (p.x - s.line.cx) * s.line.nx + (p.z - s.line.cz) * s.line.nz
+		if t > maxT then maxT = t end
+	end
+	s.bias = maxT
+	s.line.cx += s.line.nx * maxT
+	s.line.cz += s.line.nz * maxT
+end
+
+local function segLength(s: any): number
+	local L, lo, hi = s.line, math.huge, -math.huge
+	for _, p in ipairs(s.pts) do
+		local u = (p.x - L.cx) * L.dx + (p.z - L.cz) * L.dz
+		if u < lo then lo = u end
+		if u > hi then hi = u end
+	end
+	return hi - lo
 end
 
 -- A rounded wall segments into many short pieces: correct, but poly-heavy. Merge
@@ -393,7 +411,7 @@ function Boundary2.mergeCollinear(segs: { any }, cfg: Config?)
 		local prev = out[#out]
 		if prev and prev.line and s.line then
 			local dot = math.abs(prev.line.dx * s.line.dx + prev.line.dz * s.line.dz)
-			local short = #s.pts < c.minSegLen
+			local short = segLength(s) < c.minSegLen
 			if dot >= cosLimit or short then
 				local pts = table.clone(prev.pts)
 				table.move(s.pts, 1, #s.pts, #pts + 1, pts)
@@ -407,28 +425,10 @@ function Boundary2.mergeCollinear(segs: { any }, cfg: Config?)
 		end
 		out[#out + 1] = s
 	end
-	return Boundary2.reorient(out)
-end
-
-function Boundary2.reorient(segs: { any })
-	for _, s in ipairs(segs) do
-		if s.line then
-			local ax, az = 0, 0
-			for _, p in ipairs(s.pts) do ax += p.inx; az += p.inz end
-			if s.line.nx * ax + s.line.nz * az < 0 then
-				s.line.nx = -s.line.nx
-				s.line.nz = -s.line.nz
-			end
-			local maxT = 0
-			for _, p in ipairs(s.pts) do
-				local t = (p.x - s.line.cx) * s.line.nx + (p.z - s.line.cz) * s.line.nz
-				if t > maxT then maxT = t end
-			end
-			s.line.cx += s.line.nx * maxT
-			s.line.cz += s.line.nz * maxT
-		end
+	for _, s in ipairs(out) do
+		if s.line then Boundary2.orientInward(s) end
 	end
-	return segs
+	return out
 end
 
 --------------------------------------------------------------------------------
@@ -455,30 +455,77 @@ local function halfWidthAt(comp: any, px: number, pz: number, nx: number, nz: nu
 	return best
 end
 
+-- Half-width is measured per cell, and a segment is SPLIT where it changes band
+-- rather than collapsed to its minimum. Taking the minimum over a whole segment
+-- reproduces the very failure the grading exists to prevent, one level down: a
+-- single doorway pinch anywhere along a 196-cell wall would drag the entire wall
+-- into the narrow branch and rob the wide stretch of its offset. Sub-segments
+-- keep the parent's direction, so the wall stays straight; only the offset steps.
 function Boundary2.offsetSegments(comp: any, segs: { any }, cfg: Config?)
 	local c = merged(cfg)
+	local band = math.max(c.narrowMargin, 0.05)
+	local out = {}
+
 	for _, s in ipairs(segs) do
-		if s.line then
-			local L = s.line
-			local minHW = math.huge
-			for _, p in ipairs(s.pts) do
-				local hw = halfWidthAt(comp, p.x, p.z, L.nx, L.nz, c.probeCap)
-				if hw < minHW then minHW = hw end
+		if not s.line then
+			out[#out + 1] = s
+			continue
+		end
+
+		local L = s.line
+		local hw = table.create(#s.pts)
+		for i, p in ipairs(s.pts) do
+			hw[i] = halfWidthAt(comp, p.x, p.z, L.nx, L.nz, c.probeCap)
+		end
+
+		-- group consecutive cells whose graded offset falls in the same band
+		local runs, cur = {}, { i0 = 1, min = hw[1] }
+		for i = 2, #hw do
+			local o = math.clamp(hw[i] - c.narrowMargin, 0, c.radius)
+			local om = math.clamp(cur.min - c.narrowMargin, 0, c.radius)
+			if math.abs(o - om) > band then
+				cur.i1 = i - 1
+				runs[#runs + 1] = cur
+				cur = { i0 = i, min = hw[i] }
+			elseif hw[i] < cur.min then
+				cur.min = hw[i]
 			end
-			s.halfWidth = minHW
-			-- continuous in half-width: no jump at the threshold, so adjacent
-			-- polygons straddling it still share clean edges
-			s.offset = math.clamp(minHW - c.narrowMargin, 0, c.radius)
-			s.narrow = s.offset < c.radius - 1e-6
-			s.width = 2 * minHW
-			s.offsetLine = {
-				cx = L.cx + L.nx * s.offset,
-				cz = L.cz + L.nz * s.offset,
-				dx = L.dx, dz = L.dz, nx = L.nx, nz = L.nz,
+		end
+		cur.i1 = #hw
+		runs[#runs + 1] = cur
+
+		for _, r in ipairs(runs) do
+			local pts = {}
+			for i = r.i0, r.i1 do pts[#pts + 1] = s.pts[i] end
+			if #pts == 0 then continue end
+			-- same direction as the parent fit, own centroid: collinear, not wobbly
+			local sub = {
+				pts = pts,
+				line = { cx = 0, cz = 0, dx = L.dx, dz = L.dz, nx = L.nx, nz = L.nz },
+				parent = s,
 			}
+			local sx, sz = 0, 0
+			for _, p in ipairs(pts) do sx += p.x; sz += p.z end
+			sub.line.cx, sub.line.cz = sx / #pts, sz / #pts
+			Boundary2.biasInward(sub)
+
+			sub.halfWidth = r.min
+			-- continuous in half-width: no jump at a threshold, so neighbouring
+			-- runs straddling it still meet cleanly
+			sub.offset = math.clamp(r.min - c.narrowMargin, 0, c.radius)
+			sub.narrow = sub.offset < c.radius - 1e-6
+			sub.width = 2 * r.min
+			sub.offsetLine = {
+				cx = sub.line.cx + sub.line.nx * sub.offset,
+				cz = sub.line.cz + sub.line.nz * sub.offset,
+				dx = sub.line.dx, dz = sub.line.dz,
+				nx = sub.line.nx, nz = sub.line.nz,
+			}
+			out[#out + 1] = sub
 		end
 	end
-	return segs
+
+	return out
 end
 
 local function intersect(A: any, B: any)
@@ -612,7 +659,7 @@ function Boundary2.build(floorData: any, cfg: Config?)
 				local segs = Boundary2.mergeCollinear(Boundary2.fitSegments(pts, c), c)
 				local f = os.clock(); tFit += f - e
 
-				Boundary2.offsetSegments(comp, segs, c)
+				segs = Boundary2.offsetSegments(comp, segs, c)
 				local poly = Boundary2.buildPolygon(segs, c)
 				tOff += os.clock() - f
 
