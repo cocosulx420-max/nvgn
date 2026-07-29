@@ -287,7 +287,7 @@ end
 -- grid, a different outward direction, a different boundary kind, a different
 -- killer, or a different component.
 
-function Bounds.mergeRuns(result: any)
+function Bounds.mergeEdges(edges: { any })
 	local buckets: { [string]: { any } } = {}
 
 	-- Identify grids and killers by a unique id, never by tostring(instance):
@@ -306,7 +306,7 @@ function Bounds.mergeRuns(result: any)
 		return kid[k]
 	end
 
-	for _, e in ipairs(result.edges) do
+	for _, e in ipairs(edges) do
 		-- row runs perpendicular to the outward direction
 		local row, cross
 		if e.du ~= 0 then
@@ -333,6 +333,7 @@ function Bounds.mergeRuns(result: any)
 			while j < #b and b[j + 1]._cross == b[j]._cross + 1 do j += 1 end
 			runs[#runs + 1] = {
 				kind = b[i].kind,
+				source = "floor-frame",
 				a = b[i].a, b = b[j].b,
 				outDir = b[i].outDir,
 				grid = b[i].grid, part = b[i].part,
@@ -343,7 +344,11 @@ function Bounds.mergeRuns(result: any)
 			i = j + 1
 		end
 	end
+	return runs
+end
 
+function Bounds.mergeRuns(result: any)
+	local runs = Bounds.mergeEdges(result.edges)
 	result.runs = runs
 
 	local wl, dl, wn, dn = 0, 0, 0, 0
@@ -411,7 +416,9 @@ function Bounds.wallGeometry(result: any, footData: any, cfg: Config?)
 				if e and cutBy[e.id] and cutBy[e.id][part] then
 					hit[i] = e
 					nMatched += 1
-					covered[e.id] = true
+					-- coverage is per (cell, killer): a cell cut by two parts is
+					-- only covered for the one whose outline actually matched
+					covered[e.id .. "|" .. tostring(part)] = true
 				else
 					hit[i] = false
 				end
@@ -445,31 +452,25 @@ function Bounds.wallGeometry(result: any, footData: any, cfg: Config?)
 		end
 	end
 
-	-- Any wall edge whose cell no footprint span covered keeps the floor-frame
-	-- run: non-block killers, and anything the outline sampling missed.
-	local fallback = {}
-	for _, run in ipairs(result.runs) do
-		if run.kind == "wall" then
-			local keep = false
-			if not footData.foots[run.killer] then
-				keep = true
+	-- Every wall edge not covered by a footprint span keeps its floor-frame
+	-- geometry: non-block killers, and anything the outline sampling missed.
+	-- Losing a wall opens a route that does not exist, so this is exhaustive by
+	-- construction rather than by trusting the sampling to be complete.
+	local leftover, dropoffEdges = {}, {}
+	for _, e in ipairs(result.edges) do
+		if e.kind == "wall" then
+			if not covered[tostring(e.entryId) .. "|" .. tostring(e.killer)] then
+				leftover[#leftover + 1] = e
 			end
-			if keep then
-				run.source = "floor-frame"
-				fallback[#fallback + 1] = run
-			end
+		else
+			dropoffEdges[#dropoffEdges + 1] = e
 		end
 	end
+	local fallback = Bounds.mergeEdges(leftover)
 
-	local wallRuns = {}
-	for _, r in ipairs(out) do wallRuns[#wallRuns + 1] = r end
-	for _, r in ipairs(fallback) do wallRuns[#wallRuns + 1] = r end
-
-	local newRuns = {}
-	for _, r in ipairs(result.runs) do
-		if r.kind ~= "wall" then newRuns[#newRuns + 1] = r end
-	end
-	for _, r in ipairs(wallRuns) do newRuns[#newRuns + 1] = r end
+	local newRuns = Bounds.mergeEdges(dropoffEdges)
+	for _, r in ipairs(out) do newRuns[#newRuns + 1] = r end
+	for _, r in ipairs(fallback) do newRuns[#newRuns + 1] = r end
 	result.runs = newRuns
 
 	local fpLen, fbLen = 0, 0
