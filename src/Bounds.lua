@@ -192,6 +192,7 @@ function Bounds.classify(localData: any, cfg: Config?)
 				edges[#edges + 1] = {
 					kind = "wall", a = a, b = b, outDir = outDir,
 					cell = cell, grid = g, part = e.part,
+					du = d.du, dv = d.dv,
 					killer = dead.killer, comp = e.comp,
 				}
 				nWall += 1
@@ -205,6 +206,7 @@ function Bounds.classify(localData: any, cfg: Config?)
 					edges[#edges + 1] = {
 						kind = "dropoff", a = a, b = b, outDir = outDir,
 						cell = cell, grid = g, part = e.part,
+						du = d.du, dv = d.dv,
 						killer = nil, comp = e.comp,
 					}
 					nDrop += 1
@@ -240,6 +242,78 @@ function Bounds.classify(localData: any, cfg: Config?)
 end
 
 --------------------------------------------------------------------------------
+-- Merge edges into runs
+--------------------------------------------------------------------------------
+-- THIS is the step that turns a row of 1-stud cell edges into one straight line,
+-- and it is the same trick Footprint.forPart uses for its outline.
+--
+-- The staircase is not removed by fitting a line through stepped samples. It is
+-- never created: because the lattice is aligned to the part, a straight edge
+-- occupies exactly ONE lattice row, so every boundary cell in that row shares a
+-- row index and differs only in the cross index. Sort by cross, walk while the
+-- cross index increments by one, and the whole row collapses to a single
+-- segment whose endpoints are the outer corners of the first and last cell.
+--
+-- A run is broken by anything that would make one segment a lie: a different
+-- grid, a different outward direction, a different boundary kind, a different
+-- killer, or a different component.
+
+function Bounds.mergeRuns(result: any)
+	local step = result.config and result.config.step or 1
+	local buckets: { [string]: { any } } = {}
+
+	for _, e in ipairs(result.edges) do
+		-- row runs perpendicular to the outward direction
+		local row, cross
+		if e.du ~= 0 then
+			row, cross = e.cell.ui, e.cell.vi
+		else
+			row, cross = e.cell.vi, e.cell.ui
+		end
+		e._cross = cross
+		local k = table.concat({
+			tostring(e.grid.part), e.du, e.dv, row, e.kind,
+			tostring(e.killer), tostring(e.comp.id),
+		}, "|")
+		local b = buckets[k]
+		if not b then b = {}; buckets[k] = b end
+		b[#b + 1] = e
+	end
+
+	local runs = {}
+	for _, b in pairs(buckets) do
+		table.sort(b, function(x, y) return x._cross < y._cross end)
+		local i = 1
+		while i <= #b do
+			local j = i
+			while j < #b and b[j + 1]._cross == b[j]._cross + 1 do j += 1 end
+			runs[#runs + 1] = {
+				kind = b[i].kind,
+				a = b[i].a, b = b[j].b,
+				outDir = b[i].outDir,
+				grid = b[i].grid, part = b[i].part,
+				killer = b[i].killer, comp = b[i].comp,
+				cells = j - i + 1,
+				length = (b[j].b - b[i].a).Magnitude,
+			}
+			i = j + 1
+		end
+	end
+
+	result.runs = runs
+
+	local wl, dl, wn, dn = 0, 0, 0, 0
+	for _, r in ipairs(runs) do
+		if r.kind == "wall" then wn += 1; wl += r.length else dn += 1; dl += r.length end
+	end
+	result.stats.wallRuns = wn
+	result.stats.dropoffRuns = dn
+	result.stats.wallRunLength = wl
+	result.stats.dropoffRunLength = dl
+	return runs
+end
+
+--------------------------------------------------------------------------------
 -- Debug draw
 --------------------------------------------------------------------------------
 
@@ -256,7 +330,9 @@ function Bounds.visualize(result: any, parent: Instance?)
 	local WALL = Color3.fromRGB(70, 170, 255)
 	local DROP = Color3.fromRGB(120, 255, 130)
 
-	for _, e in ipairs(result.edges) do
+	-- draw merged runs when they exist, raw cell edges otherwise
+	local items = result.runs or result.edges
+	for _, e in ipairs(items) do
 		local d = e.b - e.a
 		local len = d.Magnitude
 		if len > 1e-3 then
