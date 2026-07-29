@@ -23,6 +23,8 @@ export type Config = {
 	minSegLen: number?,     -- segments shorter than this are merge candidates
 	collinearDeg: number?,  -- adjacent segments within this angle are merged
 	probeCap: number?,      -- how far inward the half-width probe marches
+	offsetBand: number?,    -- offset quantisation; controls how often the offset steps
+	minRunLen: number?,     -- cells; shorter offset runs are absorbed by a neighbour
 }
 
 local DEFAULT = {
@@ -34,6 +36,8 @@ local DEFAULT = {
 	minSegLen = 2.0,
 	collinearDeg = 8.0,
 	probeCap = 12.0,
+	offsetBand = 0.5,
+	minRunLen = 4,
 }
 
 local INF = 1e20
@@ -463,7 +467,7 @@ end
 -- keep the parent's direction, so the wall stays straight; only the offset steps.
 function Boundary2.offsetSegments(comp: any, segs: { any }, cfg: Config?)
 	local c = merged(cfg)
-	local band = math.max(c.narrowMargin, 0.05)
+	local band = math.max(c.offsetBand, 0.05)
 	local out = {}
 
 	for _, s in ipairs(segs) do
@@ -499,6 +503,27 @@ function Boundary2.offsetSegments(comp: any, segs: { any }, cfg: Config?)
 		end
 		cur.i1 = #hw
 		runs[#runs + 1] = cur
+
+		-- Half-width wobbles cell to cell, so raw band indices flip constantly and
+		-- chop a straight wall into confetti — every flip becomes an offset step
+		-- and two extra vertices. Absorb runs shorter than minRunLen into their
+		-- neighbour, always keeping the SMALLER offset so the merge stays
+		-- conservative: a short wide stretch inside a narrow one is not an excuse
+		-- to offset further than the narrow part allows.
+		if #runs > 1 then
+			local packed = { runs[1] }
+			for i = 2, #runs do
+				local rn = runs[i]
+				local prev = packed[#packed]
+				if (rn.i1 - rn.i0 + 1) < c.minRunLen or (prev.i1 - prev.i0 + 1) < c.minRunLen then
+					prev.i1 = rn.i1
+					prev.min = math.min(prev.min, rn.min)
+				else
+					packed[#packed + 1] = rn
+				end
+			end
+			runs = packed
+		end
 
 		for _, r in ipairs(runs) do
 			local pts = {}
