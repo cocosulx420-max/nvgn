@@ -522,6 +522,8 @@ function Bounds.cutOutlinesExact(footData: any, localData: any, result: any, cfg
 				a = pa, b = pb, outDir = wdir,
 				part = bucket.part, killer = bucket.part,
 				comp = ca.comp,
+				cells = j - i + 1,
+				crossSpan = cb.cross - ca.cross + 1,
 				length = (pb - pa).Magnitude,
 			}
 			i = j + 1
