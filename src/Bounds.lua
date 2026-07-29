@@ -531,7 +531,7 @@ function Bounds.stitch(result: any, maxGap: number?)
 	end
 	local open = {}
 	for k, d in pairs(deg) do
-		if d % 2 == 1 then open[#open + 1] = { k = k, p = rep[k], run = owner[k] } end
+		if d == 1 then open[#open + 1] = { k = k, p = rep[k], run = owner[k] } end
 	end
 
 	-- greedy nearest pairing
@@ -652,9 +652,12 @@ function Bounds.audit(result: any, eps: number?)
 				rep[k] = p
 			end
 		end
+		-- An open end is a vertex only ONE run touches. Odd degree is the wrong
+		-- test: a T-junction, where a chain meets the middle of another, is a
+		-- perfectly closed vertex of degree 3.
 		local open, openPts = 0, {}
 		for k, d in pairs(deg) do
-			if d % 2 == 1 then
+			if d == 1 then
 				open += 1
 				if #openPts < 12 then openPts[#openPts + 1] = rep[k] end
 			end
