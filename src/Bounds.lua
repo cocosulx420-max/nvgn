@@ -496,6 +496,83 @@ function Bounds.wallGeometry(result: any, footData: any, cfg: Config?)
 end
 
 --------------------------------------------------------------------------------
+-- Stitch open ends
+--------------------------------------------------------------------------------
+-- Two partially overlapping grids at different yaw produce boundary chains built
+-- from incommensurate lattices. Where they meet, the chains jog past each other
+-- instead of meeting at a point, so a run can end a stud or two from its
+-- continuation with no defect in either chain.
+--
+-- Close those with an explicit connector. This is safe in the only direction
+-- that matters: a connector ADDS boundary, and adding boundary can never open a
+-- route that does not exist. It can only decline to open one — the conservative
+-- error the design asks for.
+--
+-- Gaps wider than maxGap are NOT stitched. Those are real defects and should be
+-- reported rather than papered over.
+
+function Bounds.stitch(result: any, maxGap: number?)
+	local lim = maxGap or 2.5
+	local eps = 0.05
+	local function pk(p: Vector3): string
+		return ("%d,%d,%d"):format(
+			math.floor(p.X / eps + 0.5), math.floor(p.Y / eps + 0.5), math.floor(p.Z / eps + 0.5))
+	end
+
+	-- odd-degree endpoints are the open ones
+	local deg, rep, owner = {}, {}, {}
+	for _, r in ipairs(result.runs) do
+		for _, p in ipairs({ r.a, r.b }) do
+			local k = pk(p)
+			deg[k] = (deg[k] or 0) + 1
+			rep[k] = p
+			owner[k] = r
+		end
+	end
+	local open = {}
+	for k, d in pairs(deg) do
+		if d % 2 == 1 then open[#open + 1] = { k = k, p = rep[k], run = owner[k] } end
+	end
+
+	-- greedy nearest pairing
+	local cand = {}
+	for i = 1, #open do
+		for j = i + 1, #open do
+			local d = (open[i].p - open[j].p).Magnitude
+			if d <= lim and d > 1e-6 then
+				cand[#cand + 1] = { i = i, j = j, d = d }
+			end
+		end
+	end
+	table.sort(cand, function(x, y) return x.d < y.d end)
+
+	local used, added = {}, 0
+	for _, c in ipairs(cand) do
+		if not used[c.i] and not used[c.j] then
+			used[c.i], used[c.j] = true, true
+			local A, B = open[c.i], open[c.j]
+			result.runs[#result.runs + 1] = {
+				kind = A.run.kind == "wall" and B.run.kind == "wall" and "wall" or "dropoff",
+				source = "stitch",
+				a = A.p, b = B.p,
+				outDir = A.run.outDir,
+				comp = A.run.comp,
+				length = c.d,
+			}
+			added += 1
+		end
+	end
+
+	local unpaired = 0
+	for i = 1, #open do if not used[i] then unpaired += 1 end end
+
+	result.stats.openBeforeStitch = #open
+	result.stats.stitched = added
+	result.stats.unstitched = unpaired
+	return result
+end
+
+--------------------------------------------------------------------------------
 -- Audit
 --------------------------------------------------------------------------------
 -- "Looks right" is not a standard. A boundary is correct when it is watertight:
