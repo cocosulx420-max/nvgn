@@ -478,15 +478,21 @@ function Boundary2.offsetSegments(comp: any, segs: { any }, cfg: Config?)
 			hw[i] = halfWidthAt(comp, p.x, p.z, L.nx, L.nz, c.probeCap)
 		end
 
-		-- group consecutive cells whose graded offset falls in the same band
-		local runs, cur = {}, { i0 = 1, min = hw[1] }
+		-- Group consecutive cells into offset bands. Quantise into band INDICES
+		-- and split when the index changes; comparing clamped offsets against a
+		-- running minimum instead lets a run whose min is exactly one band below
+		-- the cap absorb every wide cell after it, which silently reinstates the
+		-- whole-segment minimum this split exists to avoid.
+		local function bandOf(h: number): number
+			return math.floor(math.clamp(h - c.narrowMargin, 0, c.radius) / band + 1e-9)
+		end
+
+		local runs, cur = {}, { i0 = 1, min = hw[1], band = bandOf(hw[1]) }
 		for i = 2, #hw do
-			local o = math.clamp(hw[i] - c.narrowMargin, 0, c.radius)
-			local om = math.clamp(cur.min - c.narrowMargin, 0, c.radius)
-			if math.abs(o - om) > band then
+			if bandOf(hw[i]) ~= cur.band then
 				cur.i1 = i - 1
 				runs[#runs + 1] = cur
-				cur = { i0 = i, min = hw[i] }
+				cur = { i0 = i, min = hw[i], band = bandOf(hw[i]) }
 			elseif hw[i] < cur.min then
 				cur.min = hw[i]
 			end
@@ -548,7 +554,7 @@ function Boundary2.buildPolygon(segs: { any }, cfg: Config?)
 	end
 	if #lines < 3 then return nil end
 
-	local verts, bevels = {}, 0
+	local verts, bevels, steps = {}, 0, 0
 	local limit = c.miterLimit * math.max(c.radius, 1e-3)
 
 	for i = 1, #lines do
@@ -556,13 +562,18 @@ function Boundary2.buildPolygon(segs: { any }, cfg: Config?)
 		local b = lines[(i % #lines) + 1]
 		local p = intersect(a.offsetLine, b.offsetLine)
 		local anchor = a.pts[#a.pts]
+		local spiked = false
 		if p then
 			local dx, dz = p.x - anchor.x, p.z - anchor.z
-			if math.sqrt(dx * dx + dz * dz) > limit then p = nil end
+			if math.sqrt(dx * dx + dz * dz) > limit then p = nil; spiked = true end
 		end
 		if p then
 			verts[#verts + 1] = p
 		else
+			-- parallel offset lines are a band step, not an acute corner: the two
+			-- runs share a direction and differ only in offset. Counted apart so
+			-- the miter limit's real firing rate stays visible.
+			if spiked then bevels += 1 else steps += 1 end
 			-- bevel: end of a's offset line, then start of b's
 			local ea = a.pts[#a.pts]
 			local sb = b.pts[1]
@@ -574,11 +585,10 @@ function Boundary2.buildPolygon(segs: { any }, cfg: Config?)
 				x = sb.x + b.offsetLine.nx * b.offset,
 				z = sb.z + b.offsetLine.nz * b.offset,
 			}
-			bevels += 1
 		end
 	end
 
-	return { verts = verts, bevels = bevels }
+	return { verts = verts, bevels = bevels, steps = steps }
 end
 
 --------------------------------------------------------------------------------
@@ -685,7 +695,7 @@ function Boundary2.build(floorData: any, cfg: Config?)
 		timeOffset = tOff,
 	}
 
-	local segs, narrow, bevels, severed = 0, 0, 0, 0
+	local segs, narrow, bevels, severed, steps = 0, 0, 0, 0, 0
 	for _, r in ipairs(regions) do
 		for _, s in ipairs(r.segs) do
 			if s.line then
@@ -693,8 +703,9 @@ function Boundary2.build(floorData: any, cfg: Config?)
 				if s.narrow then narrow += 1 end
 			end
 		end
-		if r.poly then bevels += r.poly.bevels end
+		if r.poly then bevels += r.poly.bevels; steps += r.poly.steps end
 	end
+	stats.bandSteps = steps
 	for _, comp in ipairs(comps) do
 		if comp.severance.severed then severed += 1 end
 	end
