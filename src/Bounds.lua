@@ -20,12 +20,22 @@
 local Bounds = {}
 
 export type Config = {
-	stepTol: number?,   -- height difference below which two cells connect
-	seamSlack: number?, -- horizontal slack when matching cells across grids
+	surfaceEps: number?, -- numerical tolerance for "the same surface continues"
 }
 
 local DEFAULT = {
-	stepTol = 2.0,
+	-- There is NO step tolerance here, deliberately. Whether an agent can step up
+	-- or drop down a height change is a traversal question, answered by
+	-- pathfinding against the finished mesh — not a meshing question. Baking a
+	-- 2-stud tolerance into adjacency made the navmesh assert that a 2-stud
+	-- ledge was continuous floor, which erased real boundaries: a ramp's side
+	-- edge simply evaporated where its drop fell under the threshold.
+	--
+	-- This epsilon is numerical only: it decides "is this literally the same
+	-- surface continuing", absorbing float noise and hairline part overlaps.
+	-- Any real height change is a boundary, and pathfinding decides what to do
+	-- with it.
+	surfaceEps = 0.25,
 	-- Extra tolerance on the covering test, beyond half a step. Incommensurate
 	-- lattices (two abutting floors at different yaw) never line up exactly, so a
 	-- little padding decides seams in favour of "the floor continues". That is
@@ -166,7 +176,7 @@ function Bounds.components(localData: any, cfg: Config?)
 		local u, v = axesOf(e.grid)
 		for _, d in ipairs(NB) do
 			local probe = e.cell.pos + u * (d.du * step) + v * (d.dv * step)
-			local other = coveringCell(hash, step, probe, c.stepTol, c.stepTol, e)
+			local other = coveringCell(hash, step, probe, c.surfaceEps, c.surfaceEps, e)
 			if other then union(e.id, other.id) end
 		end
 	end
@@ -238,7 +248,7 @@ function Bounds.classify(localData: any, cfg: Config?)
 				-- 3. off this grid entirely. Either the floor continues in another
 				-- grid (a part seam, not a boundary) or it really stops (a ledge).
 				local probe = cell.pos + outDir * step
-				if coveringCell(hash, step, probe, c.stepTol, c.stepTol, e, c.seamPad) then
+				if coveringCell(hash, step, probe, c.surfaceEps, c.surfaceEps, e, c.seamPad) then
 					nSeam += 1
 				else
 					edges[#edges + 1] = {
