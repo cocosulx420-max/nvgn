@@ -26,7 +26,13 @@ export type Config = {
 
 local DEFAULT = {
 	stepTol = 2.0,
-	seamSlack = 0.35,
+	-- Extra tolerance on the covering test, beyond half a step. Incommensurate
+	-- lattices (two abutting floors at different yaw) never line up exactly, so a
+	-- little padding decides seams in favour of "the floor continues". That is
+	-- the conservative choice here: a missed seam invents a boundary in the
+	-- middle of walkable floor, which fragments the mesh, while a slightly
+	-- generous seam only declines to cut where two floors genuinely touch.
+	seamPad = 0.08,
 	-- Vertical window when matching an outline sample to the floor it borders.
 	-- Asymmetric on purpose: a wall standing ON a floor has its underside at the
 	-- floor height, while an overhang that killed cells by CLEARANCE sits above
@@ -92,43 +98,41 @@ local function buildHash(localData: any, step: number)
 	return hash, entries
 end
 
--- Any live cell, in any grid, sitting at this world position within slack.
-local function cellNear(hash: any, step: number, p: Vector3, stepTol: number, slack: number, skip: any): any
+-- Does any live cell COVER this world point?
+--
+-- A cell is not a point, it is a step-by-step tile centred on its sample, lying
+-- in its own grid's plane. So the test is containment in that cell's own frame,
+-- not a world-axis distance to its centre.
+--
+-- Getting this wrong is what produced scattered one-cell stubs. Two abutting
+-- floors rotated 8 and 24 degrees have incommensurate lattices: a probe from one
+-- lands between cell centres of the other, so a world-axis test with 0.35 slack
+-- missed it and emitted a spurious boundary in the middle of continuous floor.
+-- Half a step in the covering cell's own frame answers correctly at any rotation.
+local function coveringCell(hash: any, step: number, p: Vector3,
+	down: number, up: number, skip: any, pad: number?): any
+	local half = step * 0.5 + (pad or 1e-3)
 	local bx, bz = math.floor(p.X / step), math.floor(p.Z / step)
+	local best, bestOff = nil, math.huge
 	for ox = -1, 1 do
 		for oz = -1, 1 do
 			local b = hash[key(bx + ox, bz + oz)]
 			if b then
 				for _, e in ipairs(b) do
 					if e ~= skip then
-						local d = e.cell.pos - p
-						if math.abs(d.Y) <= stepTol
-							and math.abs(d.X) <= slack and math.abs(d.Z) <= slack then
-							return e
+						local g = e.grid
+						local d = p - e.cell.pos
+						local du, dv, dn
+						if not g.fallback and g.u and g.v and g.n then
+							du, dv, dn = d:Dot(g.u), d:Dot(g.v), d:Dot(g.n)
+						else
+							du, dv, dn = d.X, d.Z, d.Y
 						end
-					end
-				end
-			end
-		end
-	end
-	return nil
-end
-
--- As above, but with an asymmetric vertical window, for matching a footprint
--- outline sample against the floor it borders.
-local function cellNearY(hash: any, step: number, p: Vector3, down: number, up: number, slack: number): any
-	local bx, bz = math.floor(p.X / step), math.floor(p.Z / step)
-	local best, bestDy = nil, math.huge
-	for ox = -1, 1 do
-		for oz = -1, 1 do
-			local b = hash[key(bx + ox, bz + oz)]
-			if b then
-				for _, e in ipairs(b) do
-					local d = e.cell.pos - p
-					if math.abs(d.X) <= slack and math.abs(d.Z) <= slack
-						and d.Y <= up and d.Y >= -down then
-						local ady = math.abs(d.Y)
-						if ady < bestDy then bestDy = ady; best = e end
+						if math.abs(du) <= half and math.abs(dv) <= half
+							and dn <= down and dn >= -up then
+							local off = math.abs(du) + math.abs(dv) + math.abs(dn)
+							if off < bestOff then bestOff = off; best = e end
+						end
 					end
 				end
 			end
@@ -162,7 +166,7 @@ function Bounds.components(localData: any, cfg: Config?)
 		local u, v = axesOf(e.grid)
 		for _, d in ipairs(NB) do
 			local probe = e.cell.pos + u * (d.du * step) + v * (d.dv * step)
-			local other = cellNear(hash, step, probe, c.stepTol, c.seamSlack, e)
+			local other = coveringCell(hash, step, probe, c.stepTol, c.stepTol, e)
 			if other then union(e.id, other.id) end
 		end
 	end
@@ -234,7 +238,7 @@ function Bounds.classify(localData: any, cfg: Config?)
 				-- 3. off this grid entirely. Either the floor continues in another
 				-- grid (a part seam, not a boundary) or it really stops (a ledge).
 				local probe = cell.pos + outDir * step
-				if cellNear(hash, step, probe, c.stepTol, c.seamSlack, e) then
+				if coveringCell(hash, step, probe, c.stepTol, c.stepTol, e, c.seamPad) then
 					nSeam += 1
 				else
 					edges[#edges + 1] = {
@@ -417,7 +421,7 @@ function Bounds.wallGeometry(result: any, footData: any, cfg: Config?)
 				local p = o.a + dir * ((i + 0.5) * step)
 				local probe = p + o.outDir * (step * 0.5)
 				nSamples += 1
-				local e = cellNearY(hash, step, probe, c.wallDrop, c.wallRise, step * 0.75)
+				local e = coveringCell(hash, step, probe, c.wallDrop, c.wallRise, nil, c.seamPad)
 				if e and cutBy[e.id] and cutBy[e.id][part] then
 					hit[i] = e
 					nMatched += 1
