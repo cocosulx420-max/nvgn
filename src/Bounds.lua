@@ -563,11 +563,62 @@ function Bounds.stitch(result: any, maxGap: number?)
 		end
 	end
 
+	-- Second pass: T-junctions. A chain often ends partway ALONG another run
+	-- rather than at its endpoint — a flat floor's boundary meeting a tilted
+	-- ramp's boundary, for instance. Endpoint pairing cannot see that, because
+	-- the continuation is interior to the other run. Split the target run at the
+	-- projection and connect there.
+	local tees = 0
+	for i = 1, #open do
+		if not used[i] then
+			local A = open[i]
+			local bestRun, bestT, bestD = nil, 0, lim
+			for _, run in ipairs(result.runs) do
+				if run ~= A.run and run.source ~= "stitch" then
+					local ab = run.b - run.a
+					local L2 = ab:Dot(ab)
+					if L2 > 1e-6 then
+						local t = math.clamp((A.p - run.a):Dot(ab) / L2, 0, 1)
+						-- interior only; endpoints were the first pass's job
+						if t > 0.02 and t < 0.98 then
+							local proj = run.a + ab * t
+							local d = (proj - A.p).Magnitude
+							if d < bestD then bestD = d; bestRun = run; bestT = t end
+						end
+					end
+				end
+			end
+			if bestRun then
+				local ab = bestRun.b - bestRun.a
+				local proj = bestRun.a + ab * bestT
+				-- split the target so the junction becomes a shared vertex
+				local tail = {
+					kind = bestRun.kind, source = bestRun.source,
+					a = proj, b = bestRun.b, outDir = bestRun.outDir,
+					grid = bestRun.grid, part = bestRun.part,
+					killer = bestRun.killer, comp = bestRun.comp,
+					length = (bestRun.b - proj).Magnitude,
+				}
+				bestRun.b = proj
+				bestRun.length = (proj - bestRun.a).Magnitude
+				result.runs[#result.runs + 1] = tail
+				result.runs[#result.runs + 1] = {
+					kind = A.run.kind, source = "stitch",
+					a = A.p, b = proj, outDir = A.run.outDir,
+					comp = A.run.comp, length = bestD,
+				}
+				used[i] = true
+				tees += 1
+			end
+		end
+	end
+
 	local unpaired = 0
 	for i = 1, #open do if not used[i] then unpaired += 1 end end
 
 	result.stats.openBeforeStitch = #open
 	result.stats.stitched = added
+	result.stats.stitchedTees = tees
 	result.stats.unstitched = unpaired
 	return result
 end
