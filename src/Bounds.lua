@@ -475,11 +475,18 @@ function Bounds.cutOutlines(footData: any, localData: any, result: any, cutBy: a
 					-- step away. Sweep outward a little rather than sampling a
 					-- single point, or coverage is patchy and everything it misses
 					-- falls back to the jagged floor frame.
+					-- Only that walkable floor lies outside. Requiring the probe to
+					-- also resolve back to this exact killer was too strict: where
+					-- it failed the wall was dropped entirely, and since fallback
+					-- now only covers footprint-less killers, a miss here is a hole
+					-- rather than a jagged line. If the cell cuts and floor lies
+					-- outside it, that is a wall regardless of which part the floor
+					-- lattice happened to attribute it to.
 					local e = nil
 					for _, t in ipairs({ 0.6, 1.0, 1.4 }) do
 						local hit = coveringCell(hash, step, at + wdir * (step * t),
 							c.wallDrop, c.wallRise, nil, c.seamPad)
-						if hit and cutBy[hit.id] and cutBy[hit.id][part] then e = hit; break end
+						if hit then e = hit; break end
 					end
 					if e then
 						covered[e.id .. "|" .. tostring(part)] = true
@@ -559,14 +566,23 @@ function Bounds.wallGeometry(result: any, footData: any, localData: any, cfg: Co
 	local out, covered = Bounds.cutOutlines(footData, localData, result, cutBy, c)
 	local nSpans = #out
 
-	-- Every wall edge not covered by a footprint span keeps its floor-frame
-	-- geometry: non-block killers, and anything the outline sampling missed.
-	-- Losing a wall opens a route that does not exist, so this is exhaustive by
-	-- construction rather than by trusting the sampling to be complete.
+	-- A wall edge falls back ONLY when its killer has no footprint at all.
+	--
+	-- Coverage used to be decided by probing outward from each cut cell and
+	-- seeing whether it landed on the right floor cell. That is a heuristic, and
+	-- where it missed, the edge was emitted TWICE: once as a clean cut-outline
+	-- run and again as a jagged floor-frame run lying on top of it. Both defects
+	-- in the report — the leftover staircase along stair and block bases, and the
+	-- doubled line — are that same miss.
+	--
+	-- The cut outline is derived from the same minClearance rule LocalGrid used
+	-- to kill the cell in the first place, so if a killer has a footprint, its
+	-- cut contour is by construction the geometry for every edge it caused.
+	-- Whether a probe happened to land is irrelevant.
 	local leftover, dropoffEdges = {}, {}
 	for _, e in ipairs(result.edges) do
 		if e.kind == "wall" then
-			if not covered[tostring(e.entryId) .. "|" .. tostring(e.killer)] then
+			if not (e.killer and footData.foots[e.killer]) then
 				leftover[#leftover + 1] = e
 			end
 		else
