@@ -25,6 +25,8 @@ export type Config = {
 	probeCap: number?,      -- how far inward the half-width probe marches
 	offsetBand: number?,    -- offset quantisation; controls how often the offset steps
 	minRunLen: number?,     -- cells; shorter offset runs are absorbed by a neighbour
+	dropoffOutset: number?, -- how far OUTWARD a dropoff edge sits from the cell centre
+	probeHeights: { number }?, -- heights above the floor sampled to test for a blocker
 }
 
 local DEFAULT = {
@@ -38,7 +40,12 @@ local DEFAULT = {
 	probeCap = 12.0,
 	offsetBand = 0.5,
 	minRunLen = 4,
+	dropoffOutset = 0.5,
+	probeHeights = { 1.0, 2.0, 3.0 },
 }
+
+-- Boundary direction bits, in the order sides are emitted by the tracer.
+local DIR_PX, DIR_NX, DIR_PZ, DIR_NZ = 1, 2, 4, 8
 
 local INF = 1e20
 local CELL_HALF = 0.5 -- a cell centre sits this far inward of the surface it hugs
@@ -52,6 +59,49 @@ end
 
 local function ckey(x: number, z: number): string
 	return x .. ":" .. z
+end
+
+--------------------------------------------------------------------------------
+-- 0. Wall vs dropoff classification
+--------------------------------------------------------------------------------
+-- A boundary is not one thing. A WALL boundary has something solid behind it: the
+-- agent's body cannot occupy that space, so the boundary must be offset inward by
+-- the agent radius. A DROPOFF boundary — a rooftop, ledge, cliff, or stair head —
+-- has nothing behind it but air. Offsetting it inward is actively wrong: it walls
+-- the agent off from the very edge it needs to reach in order to drop down.
+--
+-- The two are told apart by sampling, never by reading a face: for each of the
+-- four neighbours, ask the SVO whether anything is solid in that column at torso
+-- height. Something there means wall; nothing means dropoff. This answers
+-- uniformly for a Block, a Union, a MeshPart, or a pile of rubble.
+--
+-- Sampling starts a stud above the floor because the SVO is conservative by
+-- construction — surface voxels are marked solid, so the floor itself inflates
+-- upward by up to one leaf and would read as a blocker at the surface.
+--
+-- Must run at bake time, while the SVO still exists; the result is carried in the
+-- snapshot so the boundary stage itself stays pure arithmetic.
+function Boundary2.classifyBlocked(floorData: any, tree: any, cfg: Config?)
+	local c = merged(cfg)
+	local dirs = {
+		{ 1, 0, DIR_PX }, { -1, 0, DIR_NX },
+		{ 0, 1, DIR_PZ }, { 0, -1, DIR_NZ },
+	}
+	for _, s in ipairs(floorData.surfels) do
+		local ix, iz = math.floor(s.pos.X), math.floor(s.pos.Z)
+		local mask = 0
+		for _, d in ipairs(dirs) do
+			local nx, nz = ix + d[1] + 0.5, iz + d[2] + 0.5
+			for _, h in ipairs(c.probeHeights) do
+				if tree:isSolid(Vector3.new(nx, s.pos.Y + h, nz)) then
+					mask += d[3]
+					break
+				end
+			end
+		end
+		s.blocked = mask
+	end
+	return floorData
 end
 
 --------------------------------------------------------------------------------
@@ -73,7 +123,7 @@ function Boundary2.components(floorData: any, cfg: Config?)
 
 	for i, s in ipairs(surfels) do
 		local ix, iz = math.floor(s.pos.X), math.floor(s.pos.Z)
-		nodes[i] = { ix = ix, iz = iz, y = s.pos.Y, s = s }
+		nodes[i] = { ix = ix, iz = iz, y = s.pos.Y, s = s, blocked = s.blocked or 0 }
 		local k = ckey(ix, iz)
 		local b = grid[k]
 		if not b then b = {}; grid[k] = b end
@@ -225,20 +275,26 @@ function Boundary2.traceLoops(comp: any)
 	end
 
 	local edges: { [string]: { any } } = {}
-	local function addEdge(ax, az, bx, bz, cx, cz)
+	local function addEdge(ax, az, bx, bz, cx, cz, dir, blocked)
 		local k = ax .. "," .. az
 		local b = edges[k]
 		if not b then b = {}; edges[k] = b end
-		b[#b + 1] = { ax = ax, az = az, bx = bx, bz = bz, cx = cx, cz = cz, used = false }
+		b[#b + 1] = {
+			ax = ax, az = az, bx = bx, bz = bz, cx = cx, cz = cz,
+			dir = dir,
+			-- the side this edge faces has something solid behind it
+			wall = blocked % (dir * 2) >= dir,
+			used = false,
+		}
 	end
 
 	-- wound so the interior is always on the left of travel
 	for _, nd in pairs(cells) do
-		local x, z = nd.ix, nd.iz
-		if not has(x, z - 1) then addEdge(x, z, x + 1, z, x, z) end
-		if not has(x + 1, z) then addEdge(x + 1, z, x + 1, z + 1, x, z) end
-		if not has(x, z + 1) then addEdge(x + 1, z + 1, x, z + 1, x, z) end
-		if not has(x - 1, z) then addEdge(x, z + 1, x, z, x, z) end
+		local x, z, b = nd.ix, nd.iz, nd.blocked or 0
+		if not has(x, z - 1) then addEdge(x, z, x + 1, z, x, z, DIR_NZ, b) end
+		if not has(x + 1, z) then addEdge(x + 1, z, x + 1, z + 1, x, z, DIR_PX, b) end
+		if not has(x, z + 1) then addEdge(x + 1, z + 1, x, z + 1, x, z, DIR_PZ, b) end
+		if not has(x - 1, z) then addEdge(x, z + 1, x, z, x, z, DIR_NX, b) end
 	end
 
 	local loops = {}
@@ -321,9 +377,12 @@ local function loopPoints(loop: { any })
 			-- inward is the left of travel, by the winding above
 			inx = -(e.bz - e.az),
 			inz = (e.bx - e.ax),
+			wall = e.wall,
 		}
 		local last = pts[#pts]
-		if not last or last.ix ~= p.ix or last.iz ~= p.iz then
+		-- a corner cell owns two edges that may differ in kind, so identical cells
+		-- collapse only when they also agree on wall vs dropoff
+		if not last or last.ix ~= p.ix or last.iz ~= p.iz or last.wall ~= p.wall then
 			pts[#pts + 1] = p
 		end
 	end
@@ -335,9 +394,14 @@ function Boundary2.fitSegments(pts: { any }, cfg: Config?)
 	local segs, i, n = {}, 1, #pts
 
 	while i <= n do
+		local kind = pts[i].wall
 		local acc = { pts[i] }
 		local j = i + 1
 		while j <= n do
+			-- never fit across a wall/dropoff transition: the two are offset by
+			-- different rules, so a mixed segment could not be offset correctly
+			-- either way
+			if pts[j].wall ~= kind then break end
 			acc[#acc + 1] = pts[j]
 			local L = tlsLine(acc)
 			-- maximum, not average: an average lets a shallow corner hide inside a
@@ -350,10 +414,10 @@ function Boundary2.fitSegments(pts: { any }, cfg: Config?)
 		end
 
 		if #acc >= 2 then
-			segs[#segs + 1] = { pts = acc, line = tlsLine(acc) }
+			segs[#segs + 1] = { pts = acc, line = tlsLine(acc), wall = kind }
 			i += #acc -- restart from the cell that failed the fit
 		else
-			segs[#segs + 1] = { pts = acc, line = nil }
+			segs[#segs + 1] = { pts = acc, line = nil, wall = kind }
 			i += 1
 		end
 	end
@@ -413,7 +477,7 @@ function Boundary2.mergeCollinear(segs: { any }, cfg: Config?)
 	local out = {}
 	for _, s in ipairs(segs) do
 		local prev = out[#out]
-		if prev and prev.line and s.line then
+		if prev and prev.line and s.line and prev.wall == s.wall then
 			local dot = math.abs(prev.line.dx * s.line.dx + prev.line.dz * s.line.dz)
 			local short = segLength(s) < c.minSegLen
 			if dot >= cosLimit or short then
@@ -477,6 +541,31 @@ function Boundary2.offsetSegments(comp: any, segs: { any }, cfg: Config?)
 		end
 
 		local L = s.line
+
+		-- A dropoff has nothing solid behind it, so there is no body to keep clear
+		-- of: the agent must be able to stand at the real edge and step off. Place
+		-- the boundary at the floor's true extent (CELL_HALF outward of the cell
+		-- centres) with no inward bias and no radius offset. Eroding here is what
+		-- walls NPCs off from ledges they are supposed to drop from.
+		if not s.wall then
+			local sub = {
+				pts = s.pts,
+				wall = false,
+				line = { cx = L.cx, cz = L.cz, dx = L.dx, dz = L.dz, nx = L.nx, nz = L.nz },
+				halfWidth = math.huge,
+				offset = -c.dropoffOutset,
+				narrow = false,
+				dropoff = true,
+			}
+			sub.offsetLine = {
+				cx = sub.line.cx + sub.line.nx * sub.offset,
+				cz = sub.line.cz + sub.line.nz * sub.offset,
+				dx = L.dx, dz = L.dz, nx = L.nx, nz = L.nz,
+			}
+			out[#out + 1] = sub
+			continue
+		end
+
 		local hw = table.create(#s.pts)
 		for i, p in ipairs(s.pts) do
 			hw[i] = halfWidthAt(comp, p.x, p.z, L.nx, L.nz, c.probeCap)
@@ -546,6 +635,7 @@ function Boundary2.offsetSegments(comp: any, segs: { any }, cfg: Config?)
 			-- same direction as the parent fit, own centroid: collinear, not wobbly
 			local sub = {
 				pts = pts,
+				wall = true,
 				line = { cx = 0, cz = 0, dx = L.dx, dz = L.dz, nx = L.nx, nz = L.nz },
 				parent = s,
 			}
@@ -735,11 +825,18 @@ function Boundary2.build(floorData: any, cfg: Config?)
 	}
 
 	local segs, narrow, bevels, severed, steps = 0, 0, 0, 0, 0
+	local wallSegs, dropSegs, wallLen, dropLen = 0, 0, 0, 0
 	for _, r in ipairs(regions) do
 		for _, s in ipairs(r.segs) do
 			if s.line then
 				segs += 1
 				if s.narrow then narrow += 1 end
+				local len = segLength(s)
+				if s.wall then
+					wallSegs += 1; wallLen += len
+				else
+					dropSegs += 1; dropLen += len
+				end
 			end
 		end
 		if r.poly then bevels += r.poly.bevels; steps += r.poly.steps end
@@ -750,6 +847,10 @@ function Boundary2.build(floorData: any, cfg: Config?)
 	end
 	stats.segments = segs
 	stats.narrowSegments = narrow
+	stats.wallSegments = wallSegs
+	stats.dropoffSegments = dropSegs
+	stats.wallLength = wallLen
+	stats.dropoffLength = dropLen
 	stats.bevelCorners = bevels
 	stats.severedComponents = severed
 
@@ -763,25 +864,30 @@ end
 -- sit behind the full bake. Serialize the surfel field once and iterate against
 -- the cache: seconds per iteration, no raycasts, no SVO.
 
+-- v2 carries the per-surfel blocked mask, because wall vs dropoff can only be
+-- decided while the SVO exists and the boundary stage must not need it.
 function Boundary2.snapshot(floorData: any): string
-	local buf = { "NVGNSURF1", tostring(#floorData.surfels) }
+	local buf = { "NVGNSURF2", tostring(#floorData.surfels) }
 	for _, s in ipairs(floorData.surfels) do
-		buf[#buf + 1] = string.format("%.3f %.3f %.3f %.2f", s.pos.X, s.pos.Y, s.pos.Z, s.clearance)
+		buf[#buf + 1] = string.format("%.3f %.3f %.3f %.2f %d",
+			s.pos.X, s.pos.Y, s.pos.Z, s.clearance, s.blocked or 0)
 	end
 	return table.concat(buf, "\n")
 end
 
 function Boundary2.loadSnapshot(text: string)
 	local lines = string.split(text, "\n")
-	assert(lines[1] == "NVGNSURF1", "not a surfel snapshot")
+	local v = lines[1]
+	assert(v == "NVGNSURF1" or v == "NVGNSURF2", "not a surfel snapshot")
 	local surfels, index = {}, {}
 	for i = 3, #lines do
 		local l = lines[i]
 		if l ~= "" then
-			local x, y, z, cl = string.match(l, "(%S+) (%S+) (%S+) (%S+)")
+			local x, y, z, cl, bl = string.match(l, "(%S+) (%S+) (%S+) (%S+) ?(%S*)")
 			local s = {
 				pos = Vector3.new(tonumber(x), tonumber(y), tonumber(z)),
 				clearance = tonumber(cl),
+				blocked = tonumber(bl) or 0,
 			}
 			surfels[#surfels + 1] = s
 			local k = string.format("%d:%d", math.floor(s.pos.X), math.floor(s.pos.Z))
