@@ -398,7 +398,7 @@ end
 -- segment across its width. For a wall on a floor the cutting set is the whole
 -- silhouette and this reduces to the original outline.
 
-function Bounds.cutOutlines(footData: any, localData: any, result: any, cfg: Config?)
+function Bounds.cutOutlines(footData: any, localData: any, result: any, cutBy: any, cfg: Config?)
 	local c = merged(cfg)
 	local step = localData.config.step
 	local minClear = localData.config.minClearance or 1.5
@@ -462,20 +462,25 @@ function Bounds.cutOutlines(footData: any, localData: any, result: any, cfg: Con
 			local wdir = foot.u * dd.du + foot.v * dd.dv
 			local half = (dd.du ~= 0) and foot.v or foot.u
 			local rows = {}
-			for k, cell in pairs(cutting) do
+			for _, cell in pairs(cutting) do
 				if not cutting[key(cell.fc.ui + dd.du, cell.fc.vi + dd.dv)] then
-					local rowK, crossI
-					if dd.du ~= 0 then rowK = cell.fc.ui; crossI = cell.fc.vi
-					else rowK = cell.fc.vi; crossI = cell.fc.ui end
-					local lst = rows[rowK]
-					if not lst then lst = {}; rows[rowK] = lst end
-					lst[#lst + 1] = { cross = crossI, cell = cell }
-
-					-- mark the floor cell just outside as covered by this killer
+					-- Only a boundary if WALKABLE floor lies just outside, and that
+					-- floor was cut by this very part. The cut set's boundary also
+					-- runs where the floor outside is itself dead, or absent
+					-- entirely — emitting those invents wall along lines no agent
+					-- could ever stand next to.
 					local at = Vector3.new(cell.fc.bottom.X, cell.floorY, cell.fc.bottom.Z)
 					local e = coveringCell(hash, step, at + wdir * step,
 						c.wallDrop, c.wallRise, nil, c.seamPad)
-					if e then covered[e.id .. "|" .. tostring(part)] = true end
+					if e and cutBy[e.id] and cutBy[e.id][part] then
+						covered[e.id .. "|" .. tostring(part)] = true
+						local rowK, crossI
+						if dd.du ~= 0 then rowK = cell.fc.ui; crossI = cell.fc.vi
+						else rowK = cell.fc.vi; crossI = cell.fc.ui end
+						local lst = rows[rowK]
+						if not lst then lst = {}; rows[rowK] = lst end
+						lst[#lst + 1] = { cross = crossI, cell = cell }
+					end
 				end
 			end
 
@@ -528,11 +533,21 @@ end
 function Bounds.wallGeometry(result: any, footData: any, localData: any, cfg: Config?)
 	local c = merged(cfg)
 
+	-- which killers actually cut each live cell
+	local cutBy: { [number]: { [Instance]: boolean } } = {}
+	for _, e in ipairs(result.edges) do
+		if e.kind == "wall" and e.killer and e.entryId then
+			local s = cutBy[e.entryId]
+			if not s then s = {}; cutBy[e.entryId] = s end
+			s[e.killer] = true
+		end
+	end
+
 	-- Geometry comes from the cut outlines: the boundary of the set of footprint
 	-- cells that genuinely close to within minClearance of the floor, traced in
 	-- the cutter's lattice. Straight by construction, and correct for tilted and
 	-- raised parts where the silhouette is not the cut line.
-	local out, covered = Bounds.cutOutlines(footData, localData, result, c)
+	local out, covered = Bounds.cutOutlines(footData, localData, result, cutBy, c)
 	local nSpans = #out
 
 	-- Every wall edge not covered by a footprint span keeps its floor-frame
