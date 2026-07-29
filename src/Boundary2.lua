@@ -27,6 +27,7 @@ export type Config = {
 	minRunLen: number?,     -- cells; shorter offset runs are absorbed by a neighbour
 	dropoffOutset: number?, -- how far OUTWARD a dropoff edge sits from the cell centre
 	probeHeights: { number }?, -- heights above the floor sampled to test for a blocker
+	labelMinRun: number?,   -- dropoff runs shorter than this, bracketed by wall, become wall
 }
 
 local DEFAULT = {
@@ -42,6 +43,7 @@ local DEFAULT = {
 	minRunLen = 4,
 	dropoffOutset = 0.5,
 	probeHeights = { 1.0, 2.0, 3.0 },
+	labelMinRun = 3,
 }
 
 -- Boundary direction bits, in the order sides are emitted by the tracer.
@@ -268,7 +270,56 @@ end
 -- occupied and empty cells. Every loop closes exactly, holes come out as their
 -- own loops, and each edge remembers the cell that owns it.
 
-function Boundary2.traceLoops(comp: any)
+-- Along a jagged or diagonal wall a single cell owns two boundary edges, one
+-- facing the wall and one facing the gap beside it, so the raw label alternates
+-- every couple of edges and shatters the fit into dashes.
+--
+-- Close it, but only in the safe direction. Turning a dropoff into a wall is
+-- conservative: it offsets a stretch of ledge that did not need it. Turning a
+-- wall into a dropoff would place the boundary at the floor's extent with a
+-- solid part standing there, which is the one error this pipeline must never
+-- make. So short dropoff runs bracketed by wall on both sides are absorbed;
+-- wall runs are never absorbed, however short.
+local function closeWallLabel(loop: { any }, minRun: number)
+	local n = #loop
+	if n < 3 then return end
+
+	-- cyclic run-length pass
+	local start = 1
+	while start <= n and loop[start].wall == loop[((start - 2) % n) + 1].wall do
+		start += 1
+		if start > n then return end -- uniform label, nothing to close
+	end
+
+	local i, runs = start, {}
+	repeat
+		local j, w = i, loop[i].wall
+		local len = 0
+		while loop[j].wall == w and len < n do
+			len += 1
+			j = (j % n) + 1
+		end
+		runs[#runs + 1] = { i0 = i, len = len, wall = w }
+		i = j
+	until i == start
+
+	for k, run in ipairs(runs) do
+		if not run.wall and run.len < minRun then
+			local prev = runs[((k - 2) % #runs) + 1]
+			local nxt = runs[(k % #runs) + 1]
+			if prev.wall and nxt.wall then
+				local idx = run.i0
+				for _ = 1, run.len do
+					loop[idx].wall = true
+					idx = (idx % n) + 1
+				end
+			end
+		end
+	end
+end
+
+function Boundary2.traceLoops(comp: any, cfg: Config?)
+	local c = merged(cfg)
 	local cells = comp.cells
 	local function has(x: number, z: number): boolean
 		return cells[ckey(x, z)] ~= nil
@@ -323,7 +374,10 @@ function Boundary2.traceLoops(comp: any)
 					end
 					cur = nxt
 				end
-				if #loop >= 4 then loops[#loops + 1] = loop end
+				if #loop >= 4 then
+					closeWallLabel(loop, c.labelMinRun)
+					loops[#loops + 1] = loop
+				end
 			end
 		end
 	end
@@ -786,7 +840,7 @@ function Boundary2.build(floorData: any, cfg: Config?)
 		Boundary2.distanceField(comp)
 		local b = os.clock(); tEdt += b - a
 
-		local loops = Boundary2.traceLoops(comp)
+		local loops = Boundary2.traceLoops(comp, c)
 		local d = os.clock(); tTrace += d - b
 
 		comp.severance = Boundary2.severanceCheck(comp, c)
