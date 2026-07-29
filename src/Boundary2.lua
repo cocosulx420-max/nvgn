@@ -482,6 +482,24 @@ function Boundary2.offsetSegments(comp: any, segs: { any }, cfg: Config?)
 			hw[i] = halfWidthAt(comp, p.x, p.z, L.nx, L.nz, c.probeCap)
 		end
 
+		-- Smooth the half-width signal with a running MINIMUM over a window before
+		-- banding. Half-width wobbles cell to cell, so banding it raw chops a
+		-- straight wall into confetti — every flip costs an offset step and two
+		-- vertices. A running min is conservative (never offsets further than a
+		-- nearby cell allows) and, unlike absorbing short runs into a neighbour,
+		-- its influence is bounded by the window: a single pinch widens to the
+		-- window instead of dragging the whole wall down to its offset.
+		local w = math.max(math.floor(c.minRunLen / 2), 1)
+		local smooth = table.create(#hw)
+		for i = 1, #hw do
+			local m = hw[i]
+			for j = math.max(1, i - w), math.min(#hw, i + w) do
+				if hw[j] < m then m = hw[j] end
+			end
+			smooth[i] = m
+		end
+		hw = smooth
+
 		-- Group consecutive cells into offset bands. Quantise into band INDICES
 		-- and split when the index changes; comparing clamped offsets against a
 		-- running minimum instead lets a run whose min is exactly one band below
@@ -504,18 +522,14 @@ function Boundary2.offsetSegments(comp: any, segs: { any }, cfg: Config?)
 		cur.i1 = #hw
 		runs[#runs + 1] = cur
 
-		-- Half-width wobbles cell to cell, so raw band indices flip constantly and
-		-- chop a straight wall into confetti — every flip becomes an offset step
-		-- and two extra vertices. Absorb runs shorter than minRunLen into their
-		-- neighbour, always keeping the SMALLER offset so the merge stays
-		-- conservative: a short wide stretch inside a narrow one is not an excuse
-		-- to offset further than the narrow part allows.
+		-- The running min above already guarantees runs are at least window-sized,
+		-- so only degenerate single-cell runs are left to absorb.
 		if #runs > 1 then
 			local packed = { runs[1] }
 			for i = 2, #runs do
 				local rn = runs[i]
 				local prev = packed[#packed]
-				if (rn.i1 - rn.i0 + 1) < c.minRunLen or (prev.i1 - prev.i0 + 1) < c.minRunLen then
+				if (rn.i1 - rn.i0 + 1) < 2 then
 					prev.i1 = rn.i1
 					prev.min = math.min(prev.min, rn.min)
 				else
