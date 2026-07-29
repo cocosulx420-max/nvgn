@@ -259,8 +259,23 @@ end
 -- killer, or a different component.
 
 function Bounds.mergeRuns(result: any)
-	local step = result.config and result.config.step or 1
 	local buckets: { [string]: { any } } = {}
+
+	-- Identify grids and killers by a unique id, never by tostring(instance):
+	-- tostring on an Instance yields its NAME, and a map has hundreds of parts
+	-- all called "Part". Name collisions merge rows from unrelated grids and
+	-- interleave their cross indices, producing runs that span the whole map.
+	local gid, kid = {}, {}
+	local nG, nK = 0, 0
+	local function gridId(g: any): number
+		if not gid[g] then nG += 1; gid[g] = nG end
+		return gid[g]
+	end
+	local function killerId(k: Instance?): number
+		if k == nil then return 0 end
+		if not kid[k] then nK += 1; kid[k] = nK end
+		return kid[k]
+	end
 
 	for _, e in ipairs(result.edges) do
 		-- row runs perpendicular to the outward direction
@@ -272,8 +287,8 @@ function Bounds.mergeRuns(result: any)
 		end
 		e._cross = cross
 		local k = table.concat({
-			tostring(e.grid.part), e.du, e.dv, row, e.kind,
-			tostring(e.killer), tostring(e.comp.id),
+			gridId(e.grid), e.du, e.dv, row, e.kind,
+			killerId(e.killer), e.comp.id,
 		}, "|")
 		local b = buckets[k]
 		if not b then b = {}; buckets[k] = b end
