@@ -427,9 +427,19 @@ function Bounds.cutOutlinesExact(footData: any, localData: any, result: any, cfg
 		{ du = 0, dv = 1 }, { du = 0, dv = -1 },
 	}
 
-	-- (part, dir, row) -> list of {cross, footCell, floorY}
+	-- (part, dir, row, level) -> list of {cross, footCell, floorY}
 	local buckets, nMapped, nUnmapped = {}, 0, 0
 	local mapped = {}
+
+	-- Identity, never tostring(instance): tostring returns the NAME, and this map
+	-- has hundreds of parts called "Part" and six called "ClipRamp". Keying by
+	-- name collapsed unrelated killers into one bucket, so a run holding 2 cells
+	-- spanned 146 studs. Same mistake as the earlier mergeEdges bug.
+	local kid, nK = {}, 0
+	local function killerId(k: Instance): number
+		if not kid[k] then nK += 1; kid[k] = nK end
+		return kid[k]
+	end
 
 	for _, e in ipairs(result.edges) do
 		if e.kind ~= "wall" or not e.killer or not e.deadPos then continue end
@@ -475,7 +485,7 @@ function Bounds.cutOutlinesExact(footData: any, localData: any, result: any, cfg
 		-- bucket, and a run then stretches from one level to the other — that is
 		-- what produced 251-stud walls and 2091 studs of wall from 1895 edges.
 		local level = math.floor(e.cell.pos.Y * 2 + 0.5)
-		local bk = ("%s|%d|%d|%d|%d"):format(tostring(e.killer), bd.du, bd.dv, row, level)
+		local bk = ("%d|%d|%d|%d|%d"):format(killerId(e.killer), bd.du, bd.dv, row, level)
 		local bucket = buckets[bk]
 		if not bucket then
 			bucket = { part = e.killer, foot = foot, dd = bd, items = {} }
