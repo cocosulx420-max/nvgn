@@ -516,24 +516,34 @@ function Bounds.wallRuns(footData: any, localData: any, result: any, cfg: Config
 		local bx = math.floor(e.deadPos.X / step)
 		local bz = math.floor(e.deadPos.Z / step)
 		local best, bestD = nil, math.huge
+		local anyBest, anyD = nil, math.huge
 		for ox = -1, 1 do
 			for oz = -1, 1 do
 				local lst = inf.hash[key(bx + ox, bz + oz)]
 				if lst then
 					for _, b in ipairs(lst) do
+						local dx = b.cell.fc.bottom.X - e.deadPos.X
+						local dz = b.cell.fc.bottom.Z - e.deadPos.Z
+						local d2 = dx * dx + dz * dz
 						if b.dirIdx == bestIdx then
-							local dx = b.cell.fc.bottom.X - e.deadPos.X
-							local dz = b.cell.fc.bottom.Z - e.deadPos.Z
-							local d2 = dx * dx + dz * dz
 							if d2 < bestD then bestD = d2; best = b end
 						end
+						if d2 < anyD then anyD = d2; anyBest = b end
 					end
 				end
 			end
 		end
 		if not best or bestD > (step * 1.6) ^ 2 then
-			nUnmapped += 1
-			continue
+			-- At corners and where the cut set turns, the boundary cell covering
+			-- this edge may face a neighbouring direction. Falling back to the
+			-- nearest boundary cell of any face keeps the edge on a real cut line
+			-- instead of dumping it into the jagged floor frame.
+			if anyBest and anyD <= (step * 1.2) ^ 2 then
+				best, bestD = anyBest, anyD
+			else
+				nUnmapped += 1
+				continue
+			end
 		end
 
 		local slot = backed[e.killer]
@@ -560,11 +570,23 @@ function Bounds.wallRuns(footData: any, localData: any, result: any, cfg: Config
 			for cross in pairs(rowSlot.crosses) do list[#list + 1] = cross end
 			table.sort(list)
 
+			-- Bridge a gap ONLY where the cutter's own boundary continues through it.
+			-- A skipped cross with a boundary cell present is a lattice hiccup: the
+			-- wall is physically there, no floor edge just happened to map to it. A
+			-- doorway has no cut boundary at all, so it can never be bridged — which
+			-- is what made the earlier blanket tolerance unsafe.
+			local function bridgeable(from: number, to: number): boolean
+				if to - from <= 1 then return true end
+				for x = from + 1, to - 1 do
+					if not rr.cells[x] then return false end
+				end
+				return true
+			end
+
 			local i = 1
 			while i <= #list do
 				local j = i
-				-- a hiccup of one cell is lattice mismatch; a real opening is wider
-				while j < #list and list[j + 1] - list[j] <= 2 do j += 1 end
+				while j < #list and bridgeable(list[j], list[j + 1]) do j += 1 end
 				local ca = rr.cells[list[i]]
 				local cb = rr.cells[list[j]]
 				if ca and cb then
