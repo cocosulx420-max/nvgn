@@ -52,13 +52,18 @@ local function key(a: number, b: number): string
 	return a .. ":" .. b
 end
 
--- A grid's horizontal axes. Part-aligned grids carry their own u/v; fallback
--- grids (unions, meshes) were built on the world lattice and use world axes.
+-- A grid's IN-PLANE axes, tilt included. LocalGrid samples a part on its full
+-- local frame, so a 45 degree ramp's u and v lie in the inclined surface and its
+-- normal has Y = 0.707. Those axes must be used as they are.
+--
+-- Flattening them to horizontal was a bug: on a 45 degree ramp the flattened
+-- axis is only cos(45) = 0.707 long, so every cell edge came out 0.707 studs
+-- instead of 1.0 and left a 0.29 stud gap per cell — a dashed line up every
+-- ramp. Keeping the tilt means a run along a slope is a straight sloped
+-- segment, at the surface's real angle, with no interpolation and no snapping.
 local function axesOf(g: any): (Vector3, Vector3)
 	if not g.fallback and g.u and g.v then
-		local u = Vector3.new(g.u.X, 0, g.u.Z)
-		u = (u.Magnitude > 1e-4) and u.Unit or Vector3.xAxis
-		return u, Vector3.new(-u.Z, 0, u.X)
+		return g.u, g.v
 	end
 	return Vector3.xAxis, Vector3.zAxis
 end
@@ -484,6 +489,62 @@ function Bounds.wallGeometry(result: any, footData: any, cfg: Config?)
 	result.stats.outlineSamples = nSamples
 	result.stats.outlineMatched = nMatched
 	return result
+end
+
+--------------------------------------------------------------------------------
+-- Audit
+--------------------------------------------------------------------------------
+-- "Looks right" is not a standard. A boundary is correct when it is watertight:
+-- every run endpoint meets another run endpoint, so the boundary closes into
+-- loops with no open ends. An open end is a gap — a place the mesh would leak
+-- through — and it is the metric to drive to zero before moving on.
+--
+-- Wall runs come from cutter frames and dropoff runs from floor frames, so the
+-- two only meet where a wall abuts a ledge. Closure is therefore reported per
+-- kind as well as overall.
+
+function Bounds.audit(result: any, eps: number?)
+	local e = eps or 0.05
+	local function pk(p: Vector3): string
+		return ("%d,%d,%d"):format(
+			math.floor(p.X / e + 0.5), math.floor(p.Y / e + 0.5), math.floor(p.Z / e + 0.5))
+	end
+
+	local function closure(runs: { any })
+		local deg: { [string]: number } = {}
+		local rep: { [string]: Vector3 } = {}
+		for _, r in ipairs(runs) do
+			for _, p in ipairs({ r.a, r.b }) do
+				local k = pk(p)
+				deg[k] = (deg[k] or 0) + 1
+				rep[k] = p
+			end
+		end
+		local open, openPts = 0, {}
+		for k, d in pairs(deg) do
+			if d % 2 == 1 then
+				open += 1
+				if #openPts < 12 then openPts[#openPts + 1] = rep[k] end
+			end
+		end
+		return open, openPts, deg
+	end
+
+	local wall, drop = {}, {}
+	for _, r in ipairs(result.runs) do
+		if r.kind == "wall" then wall[#wall + 1] = r else drop[#drop + 1] = r end
+	end
+
+	local dOpen, dPts = closure(drop)
+	local wOpen, wPts = closure(wall)
+	local aOpen, aPts = closure(result.runs)
+
+	result.audit = {
+		dropoffRuns = #drop, dropoffOpenEnds = dOpen, dropoffOpenPoints = dPts,
+		wallRuns = #wall, wallOpenEnds = wOpen, wallOpenPoints = wPts,
+		allOpenEnds = aOpen, allOpenPoints = aPts,
+	}
+	return result.audit
 end
 
 --------------------------------------------------------------------------------
