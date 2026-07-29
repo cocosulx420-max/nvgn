@@ -17,6 +17,18 @@ A baked navmesh generator for Roblox with emergent, physics-driven destruction.
 >
 > The substrate, floor extraction, agent model, and polygon optimization are
 > unchanged and validated.
+>
+> **Revision (boundary extraction).** Four corrections since the first draft of
+> this method, all inside the boundary pipeline:
+>
+> - Contours are traced per **connected component** (step-tolerance adjacency),
+>   not per height layer. Balconies no longer poison the floor below them.
+> - The fit is **inward-biased by construction**. The old offset *budget* did
+>   not close; this replaces a probabilistic bound with an exact one.
+> - Miter joins take a **miter limit with bevel fallback**. Acute corners
+>   otherwise spike arbitrarily far out.
+> - The narrow-region branch is **graded**, not binary, and union-find is
+>   **mandatory** — it is the only severance detector in the pipeline.
 
 ## Guiding constraints
 
@@ -94,23 +106,45 @@ Floor extraction is embarrassingly parallel (per-cell independent). Parallel Lua
 
 ### Cost note
 
-Every step below is arithmetic over cells already in memory. **Zero raycasts, zero physics queries.** Against the raycast-bound floor stage this should be a rounding error, and it removes the old approach's per-face clipping work. Expensive stage is unchanged; this one is downstream of it.
+Every step below is arithmetic over cells already in memory. **Zero raycasts, zero physics queries.** Against the raycast-bound floor stage this is a rounding error, and it removes the old approach's per-face clipping work. Expensive stage is unchanged; this one is downstream of it.
+
+This is a **complexity argument, not an extrapolation from the test scene**, so the missing bake profile does not weaken it: floor extraction is two raycasts per cell, component labelling / EDT / fitting are a handful of arithmetic ops per cell, and that ratio is invariant in map size. Untested, but not uncalibrated.
+
+The one part that is not per-cell arithmetic is **contour tracing** — loop-following with pointer chasing, so on a large multi-level map its cost is cache behaviour, not op count. Still nowhere near raycast cost.
+
+### Iterating on this stage
+
+Boundary extraction reads `FloorData` and nothing else, so **it does not have to sit behind the 20-30 minute bake.** Serialize the surfel field once and iterate the boundary code against the cached snapshot: seconds per iteration, no raycasts, no SVO. The constants below (offset radius, fit tolerance, minimum segment length, narrow-region margin) all need empirical tuning, and this is the loop to tune them in.
+
+Keep snapshots of scenes that actually stress the pipeline — a spiral ramp, a balcony over floor, a curved union, an acute corner. A snapshot of the 177-part test scene makes every constant look fine and calibrates none of them.
 
 ### Pipeline
 
-**1. Distance transform.**
-Compute a **Euclidean** distance transform (EDT) over the surfel occupancy: every walkable cell gets `D`, the distance to the nearest non-walkable cell. One cheap grid pass, no geometry.
+**1. Label connected components.**
+Everything downstream operates **per component**, never per height slice.
+
+Label connected components over surfel adjacency, where two neighbouring cells connect **iff their height difference is below the step tolerance**. That predicate is not arbitrary: it is exactly the relation that decides whether an agent can step between two cells, so a component is precisely a mutually reachable set.
+
+This replaces the earlier "trace per height layer," which was never a specification. Height banding is the wrong abstraction and a flattened XZ grid is outright wrong — a balcony would make the floor beneath it read as narrow and erode it away. Consequences of doing it this way:
+
+- **Balconies and overhangs** are separate components from the floor below, so neither contaminates the other's distance field.
+- **Spiral ramps** fall out for free: a ramp passing over itself is one component that never self-adjoins, because the vertical gap at the overlap exceeds the step tolerance. No global height banding is needed.
+
+**2. Distance transform (per component).**
+Compute a **Euclidean** distance transform (EDT) over each component's occupancy: every walkable cell gets `D`, the distance to the nearest cell not in that component. One cheap grid pass, no geometry.
+
+Because the EDT runs per component, "distance to the nearest non-walkable cell" means what it should have meant all along — distance to the edge of the reachable set.
 
 Use a true EDT, **not** a 4- or 8-neighbour structuring element — those produce a diamond or square kernel, so the resulting offset is short on the diagonals or long on them. The offset must be circular.
 
 `D` serves three purposes at once: it *is* the thickness map, it *is* the erosion test (`erode by r` == `discard cells where D < r`), and it drives the narrow-region branch below. There is no separate thickness pass.
 
-**2. Trace contours.**
-Trace boundary loops from the **surfel extent** — where floor cells end. Not from SVO solid voxels (conservative, inflated). Multi-level keys in the `index` mean loops are traced per height layer.
+**3. Trace contours (per component).**
+Trace boundary loops from the **surfel extent** — where the component's cells end. Not from SVO solid voxels (conservative, inflated).
 
 This uniformly captures both boundary sources: a cell adjacent to a wall, and a cell at a rooftop or cliff edge where the floor just stops. No distinction is needed.
 
-**3. Segment into lines (greedy fit).**
+**4. Segment into lines (greedy fit).**
 Walk each contour, maintaining a best-fit line through the cells accepted so far:
 
 - After each cell, test the **maximum perpendicular distance** from any accepted cell centre to the line. Maximum, not average — an average lets a shallow corner hide inside a long run.
@@ -123,21 +157,35 @@ Fit with **total least squares** (PCA on the cell centres), not ordinary least s
 
 Include the cells hugging the wall in the fit. They define where the wall is; excluding them degrades the fit. The offset happens after.
 
-**4. Offset the lines inward.**
-Offset each fitted line inward along its normal by the agent radius `r`, then compute corners by **intersecting the offset lines** of adjacent segments.
+**Then bias the fit inward.** After fitting, translate the line inward along its normal until **no accepted cell centre lies outward of it**. Only then hand it to step 5.
 
-Deliberately *not* done by eroding cells before tracing. Cell erosion bevels every sharp convex corner into a small arc, which the segmenter reads as two or three short segments instead of one clean corner — more polygons, the opposite of the goal. Offsetting fitted lines reconstructs corners sharp, gives a sub-cell-exact offset rather than a cell-quantized one, and leaves occupancy intact for step 5.
+This is not a tuning detail, it is what makes the safety guarantee exact. The earlier version of this document budgeted the error instead — offset `1.5`, allow the fit to deviate outward at most `1.0`, retain `0.5` residual — and that arithmetic does not close. Boundary cell centres already sit up to ~0.5 stud inward of the true wall face, and the free fit can sit outward of those centres by up to the tolerance, so a `1.5` offset can leave well under `0.5` residual clearance. Against a hard constraint ("never open a route that does not exist") a probabilistic bound is not acceptable.
 
-The miter join is free: corners were already computed by intersecting adjacent fitted lines, so intersecting the offset versions costs nothing extra.
+With the inward bias the guarantee is exact rather than probabilistic, and the fit tolerance stops carrying any safety burden — it becomes purely a polygon-count knob, free to be tuned for mesh quality alone.
 
-**Budget:** offset `1.5`, allow the fit to deviate outward at most `1.0`, retain `0.5` residual clearance.
+The translation is cheap. TLS already gives the centroid and the normal, so it is one pass over the accepted cells to find the maximum outward signed distance and shift by it.
 
-**5. Narrow-region branch (automatic).**
-Any traced region whose local **max `D`** falls below the standard radius does **not** get offset. Keep its raw fitted lines and annotate the polygon `width = 2 * maxD`.
+**5. Offset the lines inward.**
+Offset each inward-biased line further along its normal by the agent radius `r`, then compute corners by **intersecting the offset lines** of adjacent segments.
+
+Deliberately *not* done by eroding cells before tracing. Cell erosion bevels every sharp convex corner into a small arc, which the segmenter reads as two or three short segments instead of one clean corner — more polygons, the opposite of the goal. Offsetting fitted lines reconstructs corners sharp, gives a sub-cell-exact offset rather than a cell-quantized one, and leaves occupancy intact for step 6.
+
+The miter join costs nothing extra to *compute* — corners were already found by intersecting adjacent fitted lines, so intersecting the offset versions is the same operation. But it is not free geometrically: **at an acute corner the two offset lines intersect arbitrarily far out**, the classic miter spike. Apply a **miter limit with a bevel fallback** — past a threshold ratio of miter length to `r`, cut the corner with a bevel edge instead of extending to the intersection. Cheap, and without it sharp corners emit spikes into solid geometry.
+
+**6. Narrow-region branch (graded, automatic).**
+Regions too thin for a full offset are handled by **grading the offset down**, not by switching it off:
+
+```
+offset = clamp(D_local - margin, 0, r)
+```
+
+Continuous in `D`, so there is no jump at the threshold and adjacent polygons straddling it still share clean edges. A binary "skip the offset if too narrow" rule would flip between an offset of `r` and an offset of `0` across a hair's width of `D`, which is a discontinuity in the walkable boundary, not a graceful degradation. The `width` annotation grades with it rather than appearing as a flag.
+
+**`D_local`, not a region-wide max.** Use the local `D` along the segment being offset. A component containing both a wide hall and a narrow passage would otherwise take one offset for the whole thing and under-offset the hall.
 
 A 1-stud crawler passes the query-time filter; a human does not. No human decision, no bake warning, no manual flagging.
 
-Optionally run union-find on surfel adjacency before and after the offset. Any component that *would* be severed is by definition a narrow region and routes to this branch. Doubles as a check that the branch is firing.
+**Union-find is mandatory, not optional.** Run it on surfel adjacency before and after the offset. Any component that *would* be severed is by definition a narrow region. This is the pipeline's **only severance detector** — nothing else notices when the offset disconnects the map — so it is a required stage, not a debug aid.
 
 ### Invariants
 
@@ -149,11 +197,11 @@ Optionally run union-find on surfel adjacency before and after the offset. Any c
 Erosion is **asymmetric**:
 
 - A **notch** (alcove recessed into a wall) narrower than `2r` erodes away completely. Free cleanup.
-- A **protrusion** (bump sticking into the corridor) survives — the boundary offsets around it. Protrusions are absorbed by the **1-stud fit tolerance** in step 3, which is safe precisely because step 4 has already pre-paid a stud of clearance. Without the offset, that straight-line fit would cut through real geometry.
+- A **protrusion** (bump sticking into the corridor) survives — the boundary offsets around it. Protrusions are absorbed by the fit tolerance in step 4, which is safe because the **inward bias** guarantees the fitted line never sits outward of any accepted cell centre before the offset is applied. Without that bias, a straight-line fit would cut through real geometry.
 
 ### Known limits
 
-- **Curved geometry has no straight line to find.** A rounded union wall segments into many short pieces — correct, but poly-heavy. Cap with a minimum segment length plus a near-collinear merge pass.
+- **Curved geometry has no straight line to find.** A rounded union wall segments into many short pieces — correct, but poly-heavy. Cap with a minimum segment length plus a near-collinear merge pass. Careful: minimum segment length interacts badly with corner-by-intersection, since once segments get short enough adjacent offset lines barely intersect and corner positions go unstable. The miter limit covers the acute end of this; the near-parallel end needs the collinear merge to fire first.
 - Precision is capped near cell size. Intersecting fitted lines recovers sub-cell corner positions, so the result beats 1 stud, but it is not CFrame-exact. Accepted trade.
 - Boundaries carry no semantic label by construction (wall base vs. ledge vs. mesh edge are all just "boundary"). If a later system needs to know which part blocks a given boundary cell, query the SVO for the adjacent solid leaf and read its **source part ID** — sampling, not interpretation. Boundary cells with no adjacent solid are floor-extent edges (cliffs, ledges, rooftops).
 
@@ -184,7 +232,7 @@ Vertical headroom is not present in the 2D boundary geometry, so it must be bake
 
 **Revised from the original design.** Width is still not baked in open areas — the boundary edges encode it, and a portal's shared-edge length gives it directly at query time.
 
-But agent radius is now **partially baked into the mesh** by the step-4 offset, so the mesh is no longer fully continuous in agent size. Narrow regions (`maxD < r`) skip the offset and carry an explicit `width` annotation instead.
+But agent radius is now **partially baked into the mesh** by the step-5 offset, so the mesh is no longer fully continuous in agent size. Narrow regions take a graded offset (`clamp(D_local - margin, 0, r)`) and carry a `width` annotation that grades with it.
 
 Consequence, stated plainly: a small agent cannot exploit the extra room available to it in a normal-width corridor, because that room has already been offset away. **This is an accepted trade** — a streamlined mesh for the 90% case is worth more than preserving every crack for a few small entities. Narrow *routes* remain available to small agents via the width annotation; narrow *margins* inside wide corridors do not.
 
@@ -265,10 +313,14 @@ Stated as an interface, so the destruction system can be designed against it:
 
 ## Open items
 
-- **Profile the 20-30 minute bake.** Prerequisite for the destruction work and worth doing on its own merits.
+- **Component labelling and the inward-bias translation** are the two changes that affect code structure. Land both before tuning any constant.
+- **Profile the 20-30 minute bake.** Urgent on its own terms and a prerequisite for any rebake decision in the destruction section — but it does **not** gate boundary extraction, which iterates against a cached surfel snapshot.
 - **Parallelise floor extraction** across Actors.
-- **Offset radius value** — `1.5` is a starting figure. Tune against the test scene once boundaries are traced.
+- **Offset radius value** — `1.5` is a starting figure. Tune against snapshots once boundaries are traced. It no longer carries a safety budget, so it can be tuned for mesh quality alone.
+- **Fit tolerance** — `1` stud is a starting figure. Now purely a polygon-count knob.
+- **Miter limit threshold** — needs an acute-corner case to calibrate.
 - **Minimum segment length / collinear merge threshold** — needs a real curved-union case to calibrate.
-- **Narrow-region threshold** — confirm `maxD < r` is the right trigger, and whether narrow polys need their own merge rules.
+- **Narrow-region margin** — the `margin` in `clamp(D_local - margin, 0, r)`, and whether narrow polys need their own merge rules.
+- **Step tolerance for component adjacency** — shared with the polygon-merge step tolerance, or independent?
 - **Terrain** — still deferred. Boundary extraction from a grid works on terrain in principle, since it never needed a readable face; terrain's open problem is floor *sampling*, not boundary tracing.
 - **Giant tier count** — one coarse mesh, or a couple of buckets across the 9-50 stud range.
